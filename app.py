@@ -163,12 +163,10 @@
 # #     except Exception as e:
 # #         return jsonify({"error": str(e)}), 500
 
-from flask import Flask
+from flask import Flask, request, jsonify
+from geoutils import check_point
 from flask_cors import CORS
-
 app = Flask(__name__)
-
-CORS(app)
 
 # 1. Simple GET endpoint
 @app.route("/", methods=["GET"])
