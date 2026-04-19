@@ -164,7 +164,7 @@
 # #         return jsonify({"error": str(e)}), 500
 
 from flask import Flask, request, jsonify
-from geojson import check_point
+from backend.geoutils import check_point
 app = Flask(__name__)
 
 # 1. Simple GET endpoint
