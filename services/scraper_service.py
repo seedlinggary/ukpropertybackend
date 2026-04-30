@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)  # store as naive UTC
 
+from sqlalchemy.exc import IntegrityError
 from database import SessionLocal
 from models.property_listing import PropertyListing, ScraperRun
 from scrapers.registry import SCRAPER_REGISTRY
@@ -141,18 +142,22 @@ def run_scrape(source: str = "zoopla", cities: Optional[List[str]] = None) -> di
             )
 
             city_added = 0
-            # Insert new listings (guard already filtered duplicates out)
             for data in city_listings:
                 url = data.get("listing_url")
                 if not url:
                     continue
-                # Safety net: double-check uniqueness in case of race condition
-                if session.query(PropertyListing.id).filter_by(listing_url=url).first():
+                # Use a savepoint so a duplicate URL on any single row skips
+                # silently rather than rolling back the entire city's batch.
+                try:
+                    with session.begin_nested():
+                        session.add(PropertyListing(**data))
+                        session.flush()
+                except IntegrityError:
+                    logger.debug("[service] Duplicate skipped (race): %s", url)
                     continue
-                session.add(PropertyListing(**data))
                 new_properties.append(data)
-                city_added   += 1
-                total_added  += 1
+                city_added  += 1
+                total_added += 1
 
             session.commit()
             total_seen += guard.total_checked
@@ -177,6 +182,7 @@ def run_scrape(source: str = "zoopla", cities: Optional[List[str]] = None) -> di
         )
 
     except Exception as exc:
+        session.rollback()  # clear any broken transaction before writing run status
         logger.exception("[service] Run %s failed", run_id)
         completed_at     = _now()
         run_error        = str(exc)

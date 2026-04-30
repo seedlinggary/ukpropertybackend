@@ -84,7 +84,6 @@ def _curl_get(url: str) -> Optional[str]:
         return html
 
     api_key = os.getenv("SCRAPERAPI_KEY", "")
-    print('Scrapper_key',api_key)
     if api_key:
         return _scraperapi_get(url, api_key)
 
@@ -377,7 +376,11 @@ def _deepest_description(obj: Any, _d: int = 0) -> Optional[str]:
 
 
 def _fetch_full_description(listing_url: str) -> Optional[str]:
-    html = _curl_get(listing_url)
+    # Use direct curl only — no ScraperAPI fallback.
+    # Detail pages are far less aggressively Cloudflare-protected than search
+    # pages, so direct curl usually works.  Skipping ScraperAPI here saves the
+    # bulk of credits (up to 100 calls per city vs 1-2 for the search pages).
+    html = _direct_curl(listing_url)
     if not html:
         return None
     return _full_description_from_html(html)
