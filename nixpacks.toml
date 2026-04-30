@@ -1,0 +1,6 @@
+[phases.setup]
+aptPkgs = ["chromium", "chromium-driver"]
+
+[variables]
+CHROME_EXECUTABLE_PATH = "/usr/bin/chromium"
+UC_HEADLESS = "1"

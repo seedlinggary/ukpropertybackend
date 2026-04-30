@@ -22,12 +22,17 @@ Floor sizes arrive in square feet (unitCode="FTK"); converted to m².
 
 import json
 import logging
+import os
 import random
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# On a headless server (Railway, Render, etc.) set UC_HEADLESS=1 (default).
+# Set UC_HEADLESS=0 to open a visible browser window (local testing).
+_UC_HEADLESS = os.getenv("UC_HEADLESS", "1") == "1"
 
 BASE_URL     = "https://www.zoopla.co.uk/for-sale/property/{city}/"
 SORT_PARAM   = "newest_listings"
@@ -142,12 +147,17 @@ def _html_has_next_page(html: str, page: int) -> bool:
 # Tier 2: undetected-chromedriver browser
 # ─────────────────────────────────────────────────────────────
 
-def _make_uc_driver(headless: bool = False):
+def _make_uc_driver(headless: bool = True):
     import undetected_chromedriver as uc
     opts = uc.ChromeOptions()
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    # Railway/Render provide Chromium at a fixed path; honour it if set.
+    chrome_path = os.getenv("CHROME_EXECUTABLE_PATH")
+    if chrome_path:
+        opts.binary_location = chrome_path
     return uc.Chrome(options=opts, headless=headless, use_subprocess=True)
 
 
@@ -411,7 +421,7 @@ class ZooplaScraper(BaseScraper):
                     logger.info("[zoopla/browser] curl empty — launching UC browser")
                     used_browser = True
                     if uc_driver is None:
-                        uc_driver = _make_uc_driver(headless=False)
+                        uc_driver = _make_uc_driver(headless=_UC_HEADLESS)
                         uc_driver.get(url)
                         time.sleep(random.uniform(3.0, 5.0))
                         if not _wait_for_cloudflare(uc_driver):
