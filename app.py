@@ -185,6 +185,11 @@ Base.metadata.create_all(bind=engine)
 
 app.register_blueprint(scraper_bp)
 
+# Start the 12-hour background scheduler.
+# Called here (module level) so it runs under gunicorn too, not just `python app.py`.
+# start_scheduler() is idempotent — safe to call multiple times.
+start_scheduler()
+
 
 # --- existing routes (unchanged) ---
 
@@ -215,7 +220,6 @@ def location():
 
 
 if __name__ == "__main__":
-    start_scheduler()
     app.run(debug=True)
 # if __name__ == "__main__":
 #     init_db()

@@ -1,6 +1,8 @@
 annotated-types==0.7.0
 anyio==4.13.0
 APScheduler==3.10.4
+gunicorn==23.0.0
+resend>=2.0.0
 setuptools>=70.0.0
 attrs==26.1.0
 blinker==1.9.0

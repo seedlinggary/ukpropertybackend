@@ -154,9 +154,10 @@ def _make_uc_driver(headless: bool = True):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    # Railway/Render provide Chromium at a fixed path; honour it if set.
-    chrome_path = os.getenv("CHROME_EXECUTABLE_PATH")
-    if chrome_path:
+    # Only set binary_location when the env var points to a file that exists.
+    # Setting it to a non-existent path triggers a TypeError inside UC driver.
+    chrome_path = os.getenv("CHROME_EXECUTABLE_PATH", "")
+    if chrome_path and os.path.isfile(chrome_path):
         opts.binary_location = chrome_path
     return uc.Chrome(options=opts, headless=headless, use_subprocess=True)
 
