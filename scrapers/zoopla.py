@@ -154,12 +154,25 @@ def _make_uc_driver(headless: bool = True):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    # Only set binary_location when the env var points to a file that exists.
-    # Setting it to a non-existent path triggers a TypeError inside UC driver.
+
+    # Only set binary_location when the path actually exists on disk.
     chrome_path = os.getenv("CHROME_EXECUTABLE_PATH", "")
     if chrome_path and os.path.isfile(chrome_path):
         opts.binary_location = chrome_path
-    return uc.Chrome(options=opts, headless=headless, use_subprocess=True)
+
+    # Use the system chromedriver if available so the driver version always
+    # matches the installed browser.  Without this, UC driver downloads the
+    # latest ChromeDriver which can be one version ahead of the apt package
+    # (e.g. driver=148 vs browser=147 → SessionNotCreatedException).
+    driver_path = os.getenv("CHROMEDRIVER_PATH", "")
+    driver_executable = driver_path if (driver_path and os.path.isfile(driver_path)) else None
+
+    return uc.Chrome(
+        options=opts,
+        headless=headless,
+        use_subprocess=True,
+        driver_executable_path=driver_executable,
+    )
 
 
 def _wait_for_cloudflare(driver, timeout: int = 30) -> bool:
