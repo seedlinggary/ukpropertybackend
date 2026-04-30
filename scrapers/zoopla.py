@@ -73,6 +73,25 @@ def _search_url(city_slug: str, page: int) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def _curl_get(url: str) -> Optional[str]:
+    """
+    Tier 1a — direct curl with Chrome TLS impersonation (fast; works from
+    residential / home IPs but blocked by Cloudflare on datacenter IPs).
+    Tier 1b — ScraperAPI fallback (residential proxy pool; set SCRAPERAPI_KEY).
+    Returns None if both fail so the caller can fall through to the browser.
+    """
+    html = _direct_curl(url)
+    if html:
+        return html
+
+    api_key = os.getenv("SCRAPERAPI_KEY", "")
+    print('Scrapper_key',api_key)
+    if api_key:
+        return _scraperapi_get(url, api_key)
+
+    return None
+
+
+def _direct_curl(url: str) -> Optional[str]:
     try:
         from curl_cffi import requests as cffi_req
         resp = cffi_req.get(
@@ -87,11 +106,34 @@ def _curl_get(url: str) -> Optional[str]:
             return None
         html = resp.text
         if any(s in html.lower() for s in _CF_SIGNALS):
-            logger.info("[zoopla/curl] Cloudflare challenge — will use browser")
+            logger.info("[zoopla/curl] Cloudflare challenge detected")
             return None
         return html
     except Exception:
         logger.debug("[zoopla/curl] request failed", exc_info=True)
+        return None
+
+
+def _scraperapi_get(url: str, api_key: str) -> Optional[str]:
+    """Route through ScraperAPI's residential proxy pool to bypass IP blocks."""
+    try:
+        import requests as req
+        resp = req.get(
+            "https://api.scraperapi.com/",
+            params={"api_key": api_key, "url": url, "country_code": "gb"},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            logger.warning("[zoopla/scraperapi] HTTP %d for %s", resp.status_code, url)
+            return None
+        html = resp.text
+        if any(s in html.lower() for s in _CF_SIGNALS):
+            logger.info("[zoopla/scraperapi] Cloudflare still present — falling back to browser")
+            return None
+        logger.info("[zoopla/scraperapi] Success for %s", url)
+        return html
+    except Exception:
+        logger.warning("[zoopla/scraperapi] request failed", exc_info=True)
         return None
 
 
