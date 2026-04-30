@@ -147,6 +147,23 @@ def _html_has_next_page(html: str, page: int) -> bool:
 # Tier 2: undetected-chromedriver browser
 # ─────────────────────────────────────────────────────────────
 
+def _chrome_major_version() -> Optional[int]:
+    """Read the major version from the Chrome/Chromium binary (e.g. 147)."""
+    import subprocess
+    chrome_path = os.getenv("CHROME_EXECUTABLE_PATH", "")
+    if not chrome_path or not os.path.isfile(chrome_path):
+        return None
+    try:
+        out = subprocess.run(
+            [chrome_path, "--version"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout  # e.g. "Chromium 147.0.7727.116 ..."
+        m = re.search(r"(\d+)\.", out)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 def _make_uc_driver(headless: bool = True):
     import undetected_chromedriver as uc
     opts = uc.ChromeOptions()
@@ -154,34 +171,44 @@ def _make_uc_driver(headless: bool = True):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    # Reduce headless-detection signals
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--lang=en-GB")
 
     # Only set binary_location when the path actually exists on disk.
     chrome_path = os.getenv("CHROME_EXECUTABLE_PATH", "")
     if chrome_path and os.path.isfile(chrome_path):
         opts.binary_location = chrome_path
 
-    # Use the system chromedriver if available so the driver version always
-    # matches the installed browser.  Without this, UC driver downloads the
-    # latest ChromeDriver which can be one version ahead of the apt package
-    # (e.g. driver=148 vs browser=147 → SessionNotCreatedException).
+    # Use the system chromedriver so its version matches the installed browser.
+    # Without this UC driver downloads the latest ChromeDriver which can be
+    # one major version ahead of the apt package (→ SessionNotCreatedException).
     driver_path = os.getenv("CHROMEDRIVER_PATH", "")
     driver_executable = driver_path if (driver_path and os.path.isfile(driver_path)) else None
+
+    # Tell UC driver the exact major version so it patches the driver correctly.
+    # If we leave this as None the warning "assuming chrome 108" fires and the
+    # patch may be applied for the wrong version.
+    version_main = _chrome_major_version()
 
     return uc.Chrome(
         options=opts,
         headless=headless,
         use_subprocess=True,
         driver_executable_path=driver_executable,
+        version_main=version_main,
     )
 
 
-def _wait_for_cloudflare(driver, timeout: int = 30) -> bool:
+def _wait_for_cloudflare(driver, timeout: int = 60) -> bool:
+    """Wait up to *timeout* seconds for Cloudflare to clear."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not any(s in driver.title.lower() for s in _CF_SIGNALS):
+        title = driver.title.lower()
+        if not any(s in title for s in _CF_SIGNALS):
             return True
         logger.info("[zoopla/browser] Cloudflare challenge active — waiting…")
-        time.sleep(2)
+        time.sleep(3)
     logger.warning("[zoopla/browser] CF challenge not resolved in %ds", timeout)
     return False
 
@@ -437,7 +464,7 @@ class ZooplaScraper(BaseScraper):
                     if uc_driver is None:
                         uc_driver = _make_uc_driver(headless=_UC_HEADLESS)
                         uc_driver.get(url)
-                        time.sleep(random.uniform(3.0, 5.0))
+                        time.sleep(random.uniform(6.0, 8.0))
                         if not _wait_for_cloudflare(uc_driver):
                             logger.warning("[zoopla/browser] CF not resolved — stopping city")
                             break
