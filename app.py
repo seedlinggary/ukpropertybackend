@@ -163,42 +163,59 @@
 # #     except Exception as e:
 # #         return jsonify({"error": str(e)}), 500
 
+import logging
+
 from flask import Flask, request, jsonify
-from geoutils import check_point
 from flask_cors import CORS
+
+from geoutils import check_point
+from database import engine
+from models import Base  # imports PropertyListing + ScraperRun into Base metadata
+from routes.scraper import scraper_bp
+from scheduler import start_scheduler
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+
 app = Flask(__name__)
 CORS(app)
-# 1. Simple GET endpoint
+
+# Create new DB tables (property_listings, scraper_runs) if they don't exist yet.
+# The existing polygons table (owned by geoutils.py's Base) is unaffected.
+Base.metadata.create_all(bind=engine)
+
+app.register_blueprint(scraper_bp)
+
+
+# --- existing routes (unchanged) ---
+
 @app.route("/", methods=["GET"])
 def home():
     return "hello world"
 
 
-# 2. POST endpoint with lat/lng input
 @app.route("/location", methods=["POST"])
 def location():
     data = request.get_json()
 
     lat = data.get("lat")
     lng = data.get("lng")
-    article4 = check_point(lat, lng)
-    is_article4 = False
-    if article4:
-        is_article4 = True
 
     if lat is None or lng is None:
         return jsonify({"error": "Missing lat or lng"}), 400
 
-    # Example: return mock data (replace with real logic)
-    result = {
+    article4 = check_point(lat, lng)
+    is_article4 = bool(article4)
+
+    return jsonify({
         "lat": lat,
         "lng": lng,
         "message": "Coordinates received",
-        "Article_4": is_article4
-    }
+        "Article_4": is_article4,
+    })
 
-    return jsonify(result)
+
 if __name__ == "__main__":
+    start_scheduler()
     app.run(debug=True)
 # if __name__ == "__main__":
 #     init_db()
