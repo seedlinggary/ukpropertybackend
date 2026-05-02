@@ -167,11 +167,13 @@ import logging
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from sqlalchemy import text
 
 from geoutils import check_point
 from database import engine
 from models import Base  # imports PropertyListing + ScraperRun into Base metadata
 from routes.scraper import scraper_bp
+from routes.properties import properties_bp
 from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -184,6 +186,7 @@ CORS(app)
 Base.metadata.create_all(bind=engine)
 
 app.register_blueprint(scraper_bp)
+app.register_blueprint(properties_bp)
 
 # Start the 12-hour background scheduler.
 # Called here (module level) so it runs under gunicorn too, not just `python app.py`.
@@ -217,6 +220,38 @@ def location():
         "message": "Coordinates received",
         "Article_4": is_article4,
     })
+
+
+@app.route("/admin/backfill-article4", methods=["POST"])
+def backfill_article4():
+    """
+    One-shot route: recomputes article4 for every property that has lat/lng
+    using a single PostGIS UPDATE — much faster than row-by-row Python.
+    POST /admin/backfill-article4
+    """
+    try:
+        with engine.connect() as conn:
+            geo = conn.execute(text("""
+                UPDATE property_listings
+                SET article4 = (
+                    SELECT COUNT(*) > 0
+                    FROM polygons
+                    WHERE ST_Contains(
+                        polygons.geom,
+                        ST_SetSRID(ST_Point(property_listings.lng, property_listings.lat), 4326)
+                    )
+                )
+                WHERE lat IS NOT NULL AND lng IS NOT NULL
+            """))
+            nulled = conn.execute(text("""
+                UPDATE property_listings
+                SET article4 = NULL
+                WHERE lat IS NULL OR lng IS NULL
+            """))
+            conn.commit()
+        return jsonify({"status": "ok", "geo_updated": geo.rowcount, "nulled": nulled.rowcount})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 if __name__ == "__main__":

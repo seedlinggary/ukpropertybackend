@@ -29,6 +29,30 @@ class PropertyListing(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "source": self.source,
+            "listing_url": self.listing_url,
+            "city": self.city,
+            "address": self.address,
+            "price": self.price,
+            "bedrooms": self.bedrooms,
+            "bathrooms": self.bathrooms,
+            "size_m2": self.size_m2,
+            "property_type": self.property_type,
+            "description": self.description,
+            "agent_name": self.agent_name,
+            "agent_phone": self.agent_phone,
+            "image_url": self.image_url,
+            "lat": self.lat,
+            "lng": self.lng,
+            "article4": bool(self.article4),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class ScraperRun(Base):
     __tablename__ = "scraper_runs"
 

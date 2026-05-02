@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from database import SessionLocal
 from models.property_listing import PropertyListing, ScraperRun
 from scrapers.registry import SCRAPER_REGISTRY
+from geoutils import check_point
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,19 @@ def run_scrape(source: str = "zoopla", cities: Optional[List[str]] = None) -> di
                 url = data.get("listing_url")
                 if not url:
                     continue
+
+                # Compute Article 4 status from the PostGIS polygons table.
+                lat = data.get("lat")
+                lng = data.get("lng")
+                if lat is not None and lng is not None:
+                    try:
+                        data["article4"] = bool(check_point(lat, lng))
+                    except Exception:
+                        logger.warning("[service] check_point failed for %s", url, exc_info=True)
+                        data["article4"] = None
+                else:
+                    data["article4"] = None
+
                 # Use a savepoint so a duplicate URL on any single row skips
                 # silently rather than rolling back the entire city's batch.
                 try:
