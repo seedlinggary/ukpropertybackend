@@ -222,6 +222,58 @@ def location():
     })
 
 
+@app.route("/article4/manual", methods=["POST"])
+def add_manual_article4():
+    """
+    Accept a hand-drawn GeoJSON polygon and insert it into the polygons table.
+    Body: { geojson, name, lpa_name, reference, start_date, end_date, notes }
+    """
+    try:
+        data = request.get_json(force=True)
+        geojson = data.get("geojson")
+        if not geojson:
+            return jsonify({"error": "Missing geojson"}), 400
+
+        from shapely.geometry import shape, MultiPolygon
+        from geoalchemy2.shape import from_shape
+        from geoutils import SessionLocal, Polygon as PolygonModel
+
+        geom = shape(geojson)
+        if geom.geom_type == "Polygon":
+            geom = MultiPolygon([geom])
+        elif geom.geom_type != "MultiPolygon":
+            return jsonify({"error": f"Unsupported geometry type: {geom.geom_type}"}), 400
+
+        direction_status = data.get("status", "active")  # active | proposed | expired
+        name_parts = [p for p in [
+            data.get("name"),
+            data.get("reference"),
+            data.get("lpa_name"),
+        ] if p]
+        base_name = " — ".join(name_parts) if name_parts else "Manual Entry"
+        display_name = f"[{direction_status.upper()}] {base_name}"
+
+        session = SessionLocal()
+        try:
+            row = PolygonModel(name=display_name, geom=from_shape(geom, srid=4326))
+            session.add(row)
+            session.commit()
+            polygon_id = row.id
+        finally:
+            session.close()
+
+        return jsonify({
+            "status": "ok",
+            "id": polygon_id,
+            "name": display_name,
+            "direction_status": direction_status,
+        })
+
+    except Exception as exc:
+        logging.exception("add_manual_article4 failed")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/admin/backfill-article4", methods=["POST"])
 def backfill_article4():
     """
