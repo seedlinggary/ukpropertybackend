@@ -123,9 +123,19 @@ def run_scrape(source: str = "zoopla", cities: Optional[List[str]] = None) -> di
     new_properties: List[Dict[str, Any]] = []
     run_error:     Optional[str] = None
 
+    # Import per-tier tracking helpers (only available for zoopla scraper).
+    try:
+        from scrapers.zoopla import reset_tier_stats, get_tier_stats
+        _has_tier_tracking = True
+    except ImportError:
+        _has_tier_tracking = False
+
     try:
         for city in cities:
             logger.info("[service] ── Scraping city: %s ──", city)
+
+            if _has_tier_tracking:
+                reset_tier_stats()
 
             guard = _CityGuard(session, city, source)
 
@@ -137,9 +147,11 @@ def run_scrape(source: str = "zoopla", cities: Optional[List[str]] = None) -> di
                 on_listing=guard,
             )
 
+            tier_stats = get_tier_stats() if _has_tier_tracking else {}
+
             logger.info(
-                "[service] City %s: checked=%d  new=%d  consec_dupes_at_stop=%d",
-                city, guard.total_checked, guard.new_count, guard.consecutive_dupes,
+                "[service] City %s: checked=%d  new=%d  consec_dupes_at_stop=%d  tier_stats=%s",
+                city, guard.total_checked, guard.new_count, guard.consecutive_dupes, tier_stats,
             )
 
             city_added = 0
@@ -181,6 +193,7 @@ def run_scrape(source: str = "zoopla", cities: Optional[List[str]] = None) -> di
                 "added":       city_added,
                 "checked":     guard.total_checked,
                 "stop_reason": guard.stop_reason or "All pages exhausted",
+                "tier_stats":  tier_stats,
             })
 
         completed_at       = _now()

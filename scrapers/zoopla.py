@@ -34,6 +34,24 @@ logger = logging.getLogger(__name__)
 # Set UC_HEADLESS=0 to open a visible browser window (local testing).
 _UC_HEADLESS = os.getenv("UC_HEADLESS", "1") == "1"
 
+# ── Env-var feature flags ────────────────────────────────────────────────────
+#
+# FETCH_DETAILS           "1" (default) | "0"
+#   Set to "0" to skip detail page fetching entirely (saves all detail credits).
+#
+# SCRAPERAPI_RESIDENTIAL  "0" (default) | "1"
+#   Whether to allow the 5-credit residential UK proxy as a last-resort fallback.
+#   Off by default — datacenter (1 credit) is tried first and is usually sufficient.
+#
+# Fallback chain for every URL (search pages and detail pages):
+#   1. Direct curl          — free, fast, works on home IPs
+#   2. UC browser           — free, Chrome installed on Railway via Dockerfile
+#   3. ScraperAPI datacenter— 1 credit, tried if both free tiers fail
+#   4. ScraperAPI residential 5 credits, only if SCRAPERAPI_RESIDENTIAL=1
+# ────────────────────────────────────────────────────────────────────────────
+_FETCH_DETAILS           = os.getenv("FETCH_DETAILS",           "1") == "1"
+_SCRAPERAPI_RESIDENTIAL  = os.getenv("SCRAPERAPI_RESIDENTIAL",  "0") == "1"
+
 BASE_URL     = "https://www.zoopla.co.uk/for-sale/property/{city}/"
 SORT_PARAM   = "newest_listings"
 MAX_PAGES    = 40           # hard ceiling; stop conditions usually fire first
@@ -65,27 +83,46 @@ OnListingFn = Callable[[Dict[str, Any]], Optional[str]]  # returns "stop"|"skip"
 
 
 def _search_url(city_slug: str, page: int) -> str:
-    return f"{BASE_URL.format(city=city_slug)}?sort={SORT_PARAM}&pn={page}"
+    return f"{BASE_URL.format(city=city_slug)}?results_sort={SORT_PARAM}&pn={page}"
 
 
 # ─────────────────────────────────────────────────────────────
 # Shared HTTP helper
 # ─────────────────────────────────────────────────────────────
 
-def _curl_get(url: str) -> Optional[str]:
+def _fetch_html(url: str, uc_driver=None, context: str = "detail") -> Optional[str]:
     """
-    Tier 1a — direct curl with Chrome TLS impersonation (fast; works from
-    residential / home IPs but blocked by Cloudflare on datacenter IPs).
-    Tier 1b — ScraperAPI fallback (residential proxy pool; set SCRAPERAPI_KEY).
-    Returns None if both fail so the caller can fall through to the browser.
+    Full fallback chain — used for detail pages (context='detail').
+    Search pages use this same chain inline in fetch_listings so each tier
+    can be tracked separately for the email report.
+      1. Direct curl           free, fast
+      2. UC browser            free, Chrome installed via Dockerfile
+      3. ScraperAPI datacenter 1 credit
+      4. ScraperAPI residential 5 credits, only if SCRAPERAPI_RESIDENTIAL=1
     """
     html = _direct_curl(url)
+    _track(context, "curl", bool(html))
     if html:
         return html
 
+    if uc_driver is not None:
+        html = _browser_get_html(uc_driver, url)
+        _track(context, "browser", bool(html))
+        if html:
+            return html
+
     api_key = os.getenv("SCRAPERAPI_KEY", "")
     if api_key:
-        return _scraperapi_get(url, api_key)
+        html = _scraperapi_get_dc(url, api_key)
+        _track(context, "scraperapi_dc", bool(html))
+        if html:
+            return html
+
+        if _SCRAPERAPI_RESIDENTIAL:
+            html = _scraperapi_get(url, api_key)
+            _track(context, "scraperapi_gb", bool(html))
+            if html:
+                return html
 
     return None
 
@@ -113,8 +150,49 @@ def _direct_curl(url: str) -> Optional[str]:
         return None
 
 
+# ─────────────────────────────────────────────────────────────
+# Per-tier stats — reset per city, read by scraper_service
+# ─────────────────────────────────────────────────────────────
+
+def _empty_tier() -> Dict[str, int]:
+    return {"attempts": 0, "successes": 0}
+
+_tier_stats: Dict[str, Dict[str, Dict[str, int]]] = {
+    "search": {
+        "curl":          _empty_tier(),
+        "browser":       _empty_tier(),
+        "scraperapi_dc": _empty_tier(),
+        "scraperapi_gb": _empty_tier(),
+    },
+    "detail": {
+        "curl":          _empty_tier(),
+        "browser":       _empty_tier(),
+        "scraperapi_dc": _empty_tier(),
+        "scraperapi_gb": _empty_tier(),
+    },
+}
+
+
+def reset_tier_stats() -> None:
+    for ctx in _tier_stats.values():
+        for t in ctx.values():
+            t["attempts"] = 0
+            t["successes"] = 0
+
+
+def get_tier_stats() -> Dict[str, Dict[str, Dict[str, int]]]:
+    import copy
+    return copy.deepcopy(_tier_stats)
+
+
+def _track(context: str, tier: str, success: bool) -> None:
+    _tier_stats[context][tier]["attempts"] += 1
+    if success:
+        _tier_stats[context][tier]["successes"] += 1
+
+
 def _scraperapi_get(url: str, api_key: str) -> Optional[str]:
-    """Route through ScraperAPI's residential proxy pool to bypass IP blocks."""
+    """ScraperAPI residential UK proxy — 5 credits per request."""
     try:
         import requests as req
         resp = req.get(
@@ -123,16 +201,15 @@ def _scraperapi_get(url: str, api_key: str) -> Optional[str]:
             timeout=60,
         )
         if resp.status_code != 200:
-            logger.warning("[zoopla/scraperapi] HTTP %d for %s", resp.status_code, url)
+            logger.warning("[zoopla/scraperapi-gb] HTTP %d for %s", resp.status_code, url)
             return None
         html = resp.text
         if any(s in html.lower() for s in _CF_SIGNALS):
-            logger.info("[zoopla/scraperapi] Cloudflare still present — falling back to browser")
+            logger.info("[zoopla/scraperapi-gb] Cloudflare still present for %s", url)
             return None
-        logger.info("[zoopla/scraperapi] Success for %s", url)
         return html
     except Exception:
-        logger.warning("[zoopla/scraperapi] request failed", exc_info=True)
+        logger.warning("[zoopla/scraperapi-gb] request failed", exc_info=True)
         return None
 
 
@@ -181,7 +258,9 @@ def _schema_items_from_html(html: str) -> List[dict]:
 
 
 def _html_has_next_page(html: str, page: int) -> bool:
-    return f"?pn={page + 1}" in html or 'rel="next"' in html
+    # Check for pn= without requiring ? prefix — works whether pn is the first
+    # or a subsequent query param (e.g. &pn=2 when results_sort comes first).
+    return f"pn={page + 1}" in html or 'rel="next"' in html
 
 
 # ─────────────────────────────────────────────────────────────
@@ -190,19 +269,78 @@ def _html_has_next_page(html: str, page: int) -> bool:
 
 def _chrome_major_version() -> Optional[int]:
     """Read the major version from the Chrome/Chromium binary (e.g. 147)."""
+    # Allow explicit override via env var (useful when os.path.isfile fails on
+    # paths with spaces or permission quirks on Windows).
+    env_ver = os.getenv("CHROME_VERSION", "")
+    if env_ver:
+        try:
+            return int(env_ver)
+        except ValueError:
+            pass
+
     import subprocess
+    # Try env var path first, then fall back to candidate list
     chrome_path = os.getenv("CHROME_EXECUTABLE_PATH", "")
-    if not chrome_path or not os.path.isfile(chrome_path):
+    if not chrome_path:
+        for p in [
+            "/usr/bin/chromium", "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]:
+            if os.path.isfile(p):
+                chrome_path = p
+                break
+    if not chrome_path:
         return None
     try:
         out = subprocess.run(
             [chrome_path, "--version"],
             capture_output=True, text=True, timeout=5,
-        ).stdout  # e.g. "Chromium 147.0.7727.116 ..."
+        ).stdout  # e.g. "Google Chrome 148.0.7778.179 ..."
         m = re.search(r"(\d+)\.", out)
         return int(m.group(1)) if m else None
     except Exception:
         return None
+
+
+_CHROME_CANDIDATE_PATHS = [
+    # Linux — Railway / Render / Dockerfile (chromium package)
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    # Windows — local dev
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+]
+
+_CHROMEDRIVER_CANDIDATE_PATHS = [
+    "/usr/bin/chromedriver",
+    "/usr/local/bin/chromedriver",
+]
+
+
+def _find_chrome() -> Optional[str]:
+    """Return the first Chrome/Chromium binary that exists on this machine."""
+    explicit = os.getenv("CHROME_EXECUTABLE_PATH", "")
+    if explicit:
+        return explicit
+    for p in _CHROME_CANDIDATE_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _find_chromedriver() -> Optional[str]:
+    """Return the first chromedriver binary that exists on this machine."""
+    explicit = os.getenv("CHROMEDRIVER_PATH", "")
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    for p in _CHROMEDRIVER_CANDIDATE_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def _make_uc_driver(headless: bool = True):
@@ -212,24 +350,18 @@ def _make_uc_driver(headless: bool = True):
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    # Reduce headless-detection signals
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--lang=en-GB")
 
-    # Only set binary_location when the path actually exists on disk.
-    chrome_path = os.getenv("CHROME_EXECUTABLE_PATH", "")
-    if chrome_path and os.path.isfile(chrome_path):
+    chrome_path = _find_chrome()
+    if chrome_path:
         opts.binary_location = chrome_path
+        logger.debug("[zoopla/browser] Chrome binary: %s", chrome_path)
 
-    # Use the system chromedriver so its version matches the installed browser.
-    # Without this UC driver downloads the latest ChromeDriver which can be
-    # one major version ahead of the apt package (→ SessionNotCreatedException).
-    driver_path = os.getenv("CHROMEDRIVER_PATH", "")
-    driver_executable = driver_path if (driver_path and os.path.isfile(driver_path)) else None
+    driver_executable = _find_chromedriver()
+    if driver_executable:
+        logger.debug("[zoopla/browser] ChromeDriver: %s", driver_executable)
 
-    # Tell UC driver the exact major version so it patches the driver correctly.
-    # If we leave this as None the warning "assuming chrome 108" fires and the
-    # patch may be applied for the wrong version.
     version_main = _chrome_major_version()
 
     return uc.Chrome(
@@ -271,23 +403,18 @@ def _dom_schema_items(driver) -> List[dict]:
     return []
 
 
-def _browser_click_next(driver) -> bool:
-    """Click the pagination Next button. Returns True if clicked successfully."""
-    for selector in (
-        '[data-testid="pagination-next"]',
-        'a[rel="next"]',
-        'a[aria-label="Next page"]',
-    ):
-        try:
-            btn = driver.find_element("css selector", selector)
-            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-            time.sleep(0.3)
-            btn.click()
-            logger.info("[zoopla/browser] Clicked next-page button")
-            return True
-        except Exception:
-            pass
-    return False
+def _browser_set_sort(driver, value: str = "newest_listings") -> None:
+    """Select the sort dropdown on the first page load (once per city)."""
+    try:
+        from selenium.webdriver.support.ui import Select
+        el = driver.find_element("css selector", "select[name='results_sort']")
+        Select(el).select_by_value(value)
+        time.sleep(2)
+        logger.info("[zoopla/browser] Sort set to %s", value)
+    except Exception:
+        logger.debug("[zoopla/browser] Could not set sort dropdown", exc_info=True)
+
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -375,15 +502,44 @@ def _deepest_description(obj: Any, _d: int = 0) -> Optional[str]:
     return best
 
 
-def _fetch_full_description(listing_url: str) -> Optional[str]:
-    # Use direct curl only — no ScraperAPI fallback.
-    # Detail pages are far less aggressively Cloudflare-protected than search
-    # pages, so direct curl usually works.  Skipping ScraperAPI here saves the
-    # bulk of credits (up to 100 calls per city vs 1-2 for the search pages).
-    html = _direct_curl(listing_url)
-    if not html:
+def _fetch_full_description(listing_url: str, uc_driver=None) -> Optional[str]:
+    html = _fetch_html(listing_url, uc_driver=uc_driver)
+    return _full_description_from_html(html) if html else None
+
+
+def _scraperapi_get_dc(url: str, api_key: str) -> Optional[str]:
+    """ScraperAPI via datacenter proxy — 1 credit per request (no country_code)."""
+    try:
+        import requests as req
+        resp = req.get(
+            "https://api.scraperapi.com/",
+            params={"api_key": api_key, "url": url},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            logger.warning("[zoopla/scraperapi-dc] HTTP %d for %s", resp.status_code, url)
+            return None
+        html = resp.text
+        if any(s in html.lower() for s in _CF_SIGNALS):
+            logger.info("[zoopla/scraperapi-dc] Cloudflare still present for %s", url)
+            return None
+        return html
+    except Exception:
+        logger.warning("[zoopla/scraperapi-dc] request failed", exc_info=True)
         return None
-    return _full_description_from_html(html)
+
+
+def _browser_get_html(driver, url: str) -> Optional[str]:
+    """Navigate the already-open UC browser to a URL and return page source."""
+    try:
+        driver.get(url)
+        time.sleep(random.uniform(1.5, 2.5))
+        if not _wait_for_cloudflare(driver, timeout=30):
+            return None
+        return driver.page_source
+    except Exception:
+        logger.debug("[zoopla/browser] detail fetch failed for %s", url, exc_info=True)
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -494,45 +650,56 @@ class ZooplaScraper(BaseScraper):
                 has_next  = False
                 used_browser = False
 
-                # ── Tier 1: curl ──────────────────────────────────
-                html = _curl_get(url)
+                # ── Tier 1: direct curl (free) ────────────────────
+                # ── Tier 1: direct curl (free) ────────────────────
+                html = _direct_curl(url)
+                _track("search", "curl", bool(html))
                 if html:
                     raw_items = _schema_items_from_html(html)
                     if raw_items:
                         logger.info("[zoopla/curl] %d items on page %d", len(raw_items), page)
                         has_next = _html_has_next_page(html, page)
 
-                # ── Tier 2: UC browser ────────────────────────────
+                # ── Tier 2: UC browser (free) ─────────────────────
                 if not raw_items:
-                    logger.info("[zoopla/browser] curl empty — launching UC browser")
                     used_browser = True
                     if uc_driver is None:
                         uc_driver = _make_uc_driver(headless=_UC_HEADLESS)
-                        uc_driver.get(url)
-                        time.sleep(random.uniform(6.0, 8.0))
-                        if not _wait_for_cloudflare(uc_driver):
-                            logger.warning("[zoopla/browser] CF not resolved — stopping city")
-                            break
-                    else:
-                        # Already on previous page — click Next
-                        if not _browser_click_next(uc_driver):
-                            logger.info("[zoopla/browser] No next button — stopping city")
-                            break
-                        time.sleep(random.uniform(2.5, 4.0))
-                        if not _wait_for_cloudflare(uc_driver):
-                            break
+
+                    uc_driver.get(url)
+                    time.sleep(random.uniform(4.0, 6.0))
+                    if not _wait_for_cloudflare(uc_driver, timeout=90):
+                        logger.warning("[zoopla/browser] CF not resolved on page %d — stopping city", page)
+                        _track("search", "browser", False)
+                        break
+                    if page == 1:
+                        _browser_set_sort(uc_driver, SORT_PARAM)
 
                     raw_items = _dom_schema_items(uc_driver)
-                    # Check if next button exists for pagination signal
-                    try:
-                        uc_driver.find_element(
-                            "css selector",
-                            '[data-testid="pagination-next"], a[rel="next"]',
-                        )
-                        has_next = True
-                    except Exception:
-                        has_next = False
+                    has_next = _html_has_next_page(uc_driver.page_source, page)
+                    _track("search", "browser", bool(raw_items))
                     logger.info("[zoopla/browser] %d items on page %d", len(raw_items), page)
+
+                # ── Tier 3: ScraperAPI datacenter (1 credit) ──────
+                api_key = os.getenv("SCRAPERAPI_KEY", "")
+                if not raw_items and api_key:
+                    html = _scraperapi_get_dc(url, api_key)
+                    _track("search", "scraperapi_dc", bool(html))
+                    if html:
+                        raw_items = _schema_items_from_html(html)
+                        if raw_items:
+                            has_next = _html_has_next_page(html, page)
+                            logger.info("[zoopla/scraperapi-dc] %d items on page %d", len(raw_items), page)
+
+                # ── Tier 4: ScraperAPI residential (5 credits) ────
+                if not raw_items and api_key and _SCRAPERAPI_RESIDENTIAL:
+                    html = _scraperapi_get(url, api_key)
+                    _track("search", "scraperapi_gb", bool(html))
+                    if html:
+                        raw_items = _schema_items_from_html(html)
+                        if raw_items:
+                            has_next = _html_has_next_page(html, page)
+                            logger.info("[zoopla/scraperapi-gb] %d items on page %d", len(raw_items), page)
 
                 if not raw_items:
                     logger.info("[zoopla] No items on page %d — stopping city", page)
@@ -555,13 +722,12 @@ class ZooplaScraper(BaseScraper):
                     page_keep.append(listing)
 
                 # ── Fetch full descriptions (only for kept listings) ─
-                if fetch_details and page_keep:
-                    logger.info(
-                        "[zoopla/detail] Fetching descriptions for %d listings…",
-                        len(page_keep),
-                    )
+                if fetch_details and _FETCH_DETAILS and page_keep:
+                    logger.info("[zoopla/detail] Fetching descriptions for %d listings…", len(page_keep))
                     for listing in page_keep:
-                        full_desc = _fetch_full_description(listing["listing_url"])
+                        full_desc = _fetch_full_description(
+                            listing["listing_url"], uc_driver=uc_driver,
+                        )
                         if full_desc:
                             listing["description"] = full_desc
                         time.sleep(random.uniform(0.5, 1.5))
