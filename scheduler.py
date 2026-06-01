@@ -27,7 +27,7 @@ def start_scheduler() -> None:
         return
     _scheduler.add_job(
         func=_scheduled_scrape,
-        # trigger=IntervalTrigger(minutes=6),
+        trigger=IntervalTrigger(minutes=50),
         trigger=IntervalTrigger(hours=240),
         id="zoopla_auto_scrape",
         replace_existing=True,
