@@ -50,7 +50,7 @@ _UC_HEADLESS = os.getenv("UC_HEADLESS", "1") == "1"
 #   4. ScraperAPI residential 5 credits, only if SCRAPERAPI_RESIDENTIAL=1
 # ────────────────────────────────────────────────────────────────────────────
 _FETCH_DETAILS           = os.getenv("FETCH_DETAILS",           "1") == "1"
-_SCRAPERAPI_RESIDENTIAL  = os.getenv("SCRAPERAPI_RESIDENTIAL",  "0") == "1"
+_SCRAPERAPI_RESIDENTIAL  = os.getenv("SCRAPERAPI_RESIDENTIAL",  "1") == "1"
 
 BASE_URL     = "https://www.zoopla.co.uk/for-sale/property/{city}/"
 SORT_PARAM   = "newest_listings"
@@ -668,17 +668,15 @@ class ZooplaScraper(BaseScraper):
 
                     uc_driver.get(url)
                     time.sleep(random.uniform(4.0, 6.0))
-                    if not _wait_for_cloudflare(uc_driver, timeout=90):
-                        logger.warning("[zoopla/browser] CF not resolved on page %d — stopping city", page)
-                        _track("search", "browser", False)
-                        break
-                    if page == 1:
-                        _browser_set_sort(uc_driver, SORT_PARAM)
-
-                    raw_items = _dom_schema_items(uc_driver)
-                    has_next = _html_has_next_page(uc_driver.page_source, page)
+                    if _wait_for_cloudflare(uc_driver, timeout=90):
+                        if page == 1:
+                            _browser_set_sort(uc_driver, SORT_PARAM)
+                        raw_items = _dom_schema_items(uc_driver)
+                        has_next = _html_has_next_page(uc_driver.page_source, page)
+                        logger.info("[zoopla/browser] %d items on page %d", len(raw_items), page)
+                    else:
+                        logger.warning("[zoopla/browser] CF not resolved on page %d — trying ScraperAPI", page)
                     _track("search", "browser", bool(raw_items))
-                    logger.info("[zoopla/browser] %d items on page %d", len(raw_items), page)
 
                 # ── Tier 3: ScraperAPI datacenter (1 credit) ──────
                 api_key = os.getenv("SCRAPERAPI_KEY", "")
