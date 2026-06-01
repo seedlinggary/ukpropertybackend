@@ -373,16 +373,19 @@ def _make_uc_driver(headless: bool = True):
     )
 
 
-def _wait_for_cloudflare(driver, timeout: int = 60) -> bool:
-    """Wait up to *timeout* seconds for Cloudflare to clear."""
+def _wait_for_cloudflare(driver, timeout: int = 5) -> bool:
+    """
+    Check whether Cloudflare has cleared after an initial page load.
+    We already slept before calling this, so just poll briefly then give up —
+    a headless server browser will never solve a CF challenge on its own.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         title = driver.title.lower()
         if not any(s in title for s in _CF_SIGNALS):
             return True
-        logger.info("[zoopla/browser] Cloudflare challenge active — waiting…")
-        time.sleep(3)
-    logger.warning("[zoopla/browser] CF challenge not resolved in %ds", timeout)
+        time.sleep(1)
+    logger.warning("[zoopla/browser] CF detected — switching to ScraperAPI")
     return False
 
 
@@ -534,7 +537,7 @@ def _browser_get_html(driver, url: str) -> Optional[str]:
     try:
         driver.get(url)
         time.sleep(random.uniform(1.5, 2.5))
-        if not _wait_for_cloudflare(driver, timeout=30):
+        if not _wait_for_cloudflare(driver):
             return None
         return driver.page_source
     except Exception:
@@ -668,7 +671,7 @@ class ZooplaScraper(BaseScraper):
 
                     uc_driver.get(url)
                     time.sleep(random.uniform(4.0, 6.0))
-                    if _wait_for_cloudflare(uc_driver, timeout=90):
+                    if _wait_for_cloudflare(uc_driver):
                         if page == 1:
                             _browser_set_sort(uc_driver, SORT_PARAM)
                         raw_items = _dom_schema_items(uc_driver)
