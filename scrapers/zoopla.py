@@ -50,7 +50,7 @@ _UC_HEADLESS = os.getenv("UC_HEADLESS", "1") == "1"
 #   4. ScraperAPI residential 5 credits, only if SCRAPERAPI_RESIDENTIAL=1
 # ────────────────────────────────────────────────────────────────────────────
 _FETCH_DETAILS           = os.getenv("FETCH_DETAILS",           "1") == "1"
-_SCRAPERAPI_RESIDENTIAL  = os.getenv("SCRAPERAPI_RESIDENTIAL",  "1") == "1"
+_SCRAPERAPI_RESIDENTIAL  = os.getenv("SCRAPERAPI_RESIDENTIAL",  "0") == "1"
 
 BASE_URL     = "https://www.zoopla.co.uk/for-sale/property/{city}/"
 SORT_PARAM   = "newest_listings"
@@ -424,6 +424,17 @@ def _browser_set_sort(driver, value: str = "newest_listings") -> None:
 # Detail page: full "About this property" description
 # ─────────────────────────────────────────────────────────────
 
+def _clean_text(text: Optional[str]) -> Optional[str]:
+    """Strip HTML tags, decode entities, collapse whitespace."""
+    if not text:
+        return None
+    import html as html_mod
+    text = re.sub(r'<[^>]+>', ' ', text)       # remove any HTML tags
+    text = html_mod.unescape(text)              # &amp; → &, &#39; → ', &nbsp; → space, etc.
+    text = re.sub(r'\s+', ' ', text).strip()   # collapse whitespace
+    return text or None
+
+
 def _full_description_from_html(html: str) -> Optional[str]:
     best: Optional[str] = None
 
@@ -440,7 +451,7 @@ def _full_description_from_html(html: str) -> Optional[str]:
             pass
 
     if best and len(best) >= 200:
-        return best.strip()
+        return _clean_text(best)
 
     # Strategy 2: lsrp-schema __next_s push
     try:
@@ -467,7 +478,7 @@ def _full_description_from_html(html: str) -> Optional[str]:
         pass
 
     if best and len(best) >= 200:
-        return best.strip()
+        return _clean_text(best)
 
     # Strategy 3: "About this property" heading in raw HTML
     for pattern in (
@@ -477,12 +488,11 @@ def _full_description_from_html(html: str) -> Optional[str]:
     ):
         m = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
         if m:
-            text = re.sub(r'<[^>]+>', ' ', m.group(1))
-            text = re.sub(r'\s+', ' ', text).strip()
-            if len(text) >= 100:
+            text = _clean_text(m.group(1))
+            if text and len(text) >= 100:
                 return text
 
-    return best.strip() if best else None
+    return _clean_text(best)
 
 
 def _deepest_description(obj: Any, _d: int = 0) -> Optional[str]:
@@ -598,7 +608,7 @@ def _normalize(item: dict, city: str) -> Optional[Dict[str, Any]]:
             "bathrooms":     related.get("numberOfBathroomsTotal"),
             "size_m2":       size_m2,
             "property_type": _prop_type(related.get("@type", ""), item.get("name", "")),
-            "description":   item.get("description"),
+            "description":   _clean_text(item.get("description")),
             "agent_name":    None,
             "agent_phone":   None,
             "image_url":     item.get("image"),
