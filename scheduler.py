@@ -16,7 +16,7 @@ def _scheduled_scrape() -> None:
     from services.scraper_service import run_scrape
     logger.info("[scheduler] Triggered automatic Zoopla scrape")
     try:
-        run_scrape(source="zoopla", cities=["manchester"])
+        run_scrape(source="zoopla", cities=["london"])
         # run_scrape(source="zoopla", cities=["london", "manchester", "birmingham"])
     except Exception:
         logger.exception("[scheduler] Automatic scrape failed")
@@ -27,7 +27,7 @@ def start_scheduler() -> None:
         return
     _scheduler.add_job(
         func=_scheduled_scrape,
-        trigger=IntervalTrigger(minutes=5),
+        trigger=IntervalTrigger(minutes=90),
         # trigger=IntervalTrigger(hours=240),
         id="zoopla_auto_scrape",
         replace_existing=True,
