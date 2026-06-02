@@ -49,7 +49,7 @@ _UC_HEADLESS = os.getenv("UC_HEADLESS", "1") == "1"
 #   3. ScraperAPI datacenter— 1 credit, tried if both free tiers fail
 #   4. ScraperAPI residential 5 credits, only if SCRAPERAPI_RESIDENTIAL=1
 # ────────────────────────────────────────────────────────────────────────────
-_FETCH_DETAILS           = os.getenv("FETCH_DETAILS",           "1") == "1"
+_FETCH_DETAILS           = os.getenv("FETCH_DETAILS",           "0") == "1"
 _SCRAPERAPI_RESIDENTIAL  = os.getenv("SCRAPERAPI_RESIDENTIAL",  "0") == "1"
 
 BASE_URL     = "https://www.zoopla.co.uk/for-sale/property/{city}/"
