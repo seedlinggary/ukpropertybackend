@@ -28,7 +28,7 @@ from geoutils import check_point
 logger = logging.getLogger(__name__)
 
 DEFAULT_CITIES        = ["london"]
-MAX_LISTINGS_PER_CITY = 100   # stop after checking this many listings
+MAX_LISTINGS_PER_CITY = 250   # stop after checking this many listings
 MAX_CONSECUTIVE_DUPES = 5     # stop after this many back-to-back duplicates
 
 
