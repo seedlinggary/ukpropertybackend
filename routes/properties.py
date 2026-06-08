@@ -1,9 +1,28 @@
 from math import cos, radians
 from flask import Blueprint, jsonify, request
+from sqlalchemy import or_
 from database import SessionLocal
 from models.property_listing import PropertyListing
 
 properties_bp = Blueprint("properties", __name__)
+
+
+def _keyword_filter(q, text: str):
+    """
+    For each whitespace-separated word, require that at least one of
+    city / address / description / property_type contains it (case-insensitive).
+    All words must match — so "london flat terrace" finds listings where
+    'london' is in any column AND 'flat' is in any column AND 'terrace' is in any column.
+    """
+    for word in text.split():
+        pattern = f"%{word}%"
+        q = q.filter(or_(
+            PropertyListing.city.ilike(pattern),
+            PropertyListing.address.ilike(pattern),
+            PropertyListing.description.ilike(pattern),
+            PropertyListing.property_type.ilike(pattern),
+        ))
+    return q
 
 
 @properties_bp.route("/properties", methods=["GET"])
@@ -44,9 +63,23 @@ def list_properties():
         if source:
             q = q.filter(PropertyListing.source == source)
 
-        search = request.args.get("search")
+        city = request.args.get("city", "").strip()
+        if city:
+            q = q.filter(PropertyListing.city.ilike(f"%{city}%"))
+
+        property_type = request.args.get("property_type", "").strip()
+        if property_type:
+            q = q.filter(PropertyListing.property_type.ilike(f"%{property_type}%"))
+
+        # keyword: multi-word search across city, address, description, property_type
+        keyword = request.args.get("keyword", "").strip()
+        if keyword:
+            q = _keyword_filter(q, keyword)
+
+        # search (from SearchBar): also multi-column now
+        search = request.args.get("search", "").strip()
         if search:
-            q = q.filter(PropertyListing.address.ilike(f"%{search}%"))
+            q = _keyword_filter(q, search)
 
         # Bounding-box proximity filter (postcode search)
         lat = request.args.get("lat", type=float)
