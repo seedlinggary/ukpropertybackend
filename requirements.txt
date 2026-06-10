@@ -1,4 +1,6 @@
 annotated-types==0.7.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
 anyio==4.13.0
 APScheduler==3.10.4
 gunicorn==23.0.0
