@@ -174,6 +174,7 @@ from database import engine
 from models import Base  # imports PropertyListing + ScraperRun into Base metadata
 from routes.scraper import scraper_bp
 from routes.properties import properties_bp
+from routes.property_data import property_data_bp
 from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -187,6 +188,7 @@ Base.metadata.create_all(bind=engine)
 
 app.register_blueprint(scraper_bp)
 app.register_blueprint(properties_bp)
+app.register_blueprint(property_data_bp)
 
 # Start the 12-hour background scheduler.
 # Called here (module level) so it runs under gunicorn too, not just `python app.py`.
