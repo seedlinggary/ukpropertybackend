@@ -6,10 +6,18 @@ To add a new website:
   2. Import and register it here.
 """
 
-from scrapers.zoopla import ZooplaScraper
+from scrapers.zoopla           import ZooplaScraper
+from scrapers.allsop           import AllsopScraper
+from scrapers.savills_auctions import SavillsAuctionsScraper
+from scrapers.cliveemson       import CliveEmsonScraper
+from scrapers.auctionhouse     import AuctionHouseScraper
+from scrapers.strettons        import StrrettonsScraper
 
 SCRAPER_REGISTRY = {
-    "zoopla": ZooplaScraper(),
-    # "rightmove": RightmoveScraper(),
-    # "onthemarket": OnTheMarketScraper(),
+    "zoopla":           ZooplaScraper(),
+    "allsop":           AllsopScraper(),
+    "savills_auctions": SavillsAuctionsScraper(),
+    "cliveemson":       CliveEmsonScraper(),
+    "auctionhouse":     AuctionHouseScraper(),
+    "strettons":        StrrettonsScraper(),
 }

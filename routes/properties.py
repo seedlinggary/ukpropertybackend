@@ -10,9 +10,9 @@ properties_bp = Blueprint("properties", __name__)
 def _keyword_filter(q, text: str):
     """
     For each whitespace-separated word, require that at least one of
-    city / address / description / property_type contains it (case-insensitive).
-    All words must match — so "london flat terrace" finds listings where
-    'london' is in any column AND 'flat' is in any column AND 'terrace' is in any column.
+    city / address / description / property_type / source / agent_name contains it.
+    All words must match — so "london flat allsop" finds listings where
+    'london' is in any column AND 'flat' is in any column AND 'allsop' is in any column.
     """
     for word in text.split():
         pattern = f"%{word}%"
@@ -21,6 +21,8 @@ def _keyword_filter(q, text: str):
             PropertyListing.address.ilike(pattern),
             PropertyListing.description.ilike(pattern),
             PropertyListing.property_type.ilike(pattern),
+            PropertyListing.source.ilike(pattern),
+            PropertyListing.agent_name.ilike(pattern),
         ))
     return q
 
@@ -61,7 +63,10 @@ def list_properties():
 
         source = request.args.get("source")
         if source:
-            q = q.filter(PropertyListing.source == source)
+            if source == "auction_houses":
+                q = q.filter(PropertyListing.source != "zoopla")
+            else:
+                q = q.filter(PropertyListing.source == source)
 
         city = request.args.get("city", "").strip()
         if city:
@@ -93,9 +98,21 @@ def list_properties():
                 PropertyListing.lng.between(lng - lng_d, lng + lng_d),
             )
 
+        sort_by = request.args.get("sort_by", "newest")
+        if sort_by == "auction_date_asc":
+            order_clause = PropertyListing.auction_date.asc().nullslast()
+        elif sort_by == "auction_date_desc":
+            order_clause = PropertyListing.auction_date.desc().nullsfirst()
+        elif sort_by == "price_asc":
+            order_clause = PropertyListing.price.asc().nullslast()
+        elif sort_by == "price_desc":
+            order_clause = PropertyListing.price.desc().nullsfirst()
+        else:
+            order_clause = PropertyListing.created_at.desc()
+
         total = q.count()
         rows  = (
-            q.order_by(PropertyListing.created_at.desc())
+            q.order_by(order_clause)
              .offset(offset)
              .limit(limit)
              .all()

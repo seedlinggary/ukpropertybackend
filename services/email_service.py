@@ -39,6 +39,7 @@ def send_scrape_report(
     total_seen: int,
     new_properties: List[Dict[str, Any]],
     error: Optional[str] = None,
+    section_label: str = "By City",
 ) -> None:
     """
     Build and dispatch the scrape-completion email.
@@ -62,6 +63,7 @@ def send_scrape_report(
         html = _build_html(
             source, started_at, completed_at,
             city_stats, total_added, total_seen, error,
+            section_label=section_label,
         )
 
         attachment_content = _build_attachment(new_properties, source, completed_at)
@@ -95,6 +97,7 @@ def _build_html(
     total_added: int,
     total_seen: int,
     error: Optional[str],
+    section_label: str = "By City",
 ) -> str:
     duration_s = int((completed_at - started_at).total_seconds())
     duration   = f"{duration_s // 60}m {duration_s % 60}s"
@@ -146,7 +149,7 @@ def _build_html(
   <div style="display:flex;gap:16px;margin-bottom:28px">
     {_stat_box("New Listings Added", str(total_added), "#2563eb")}
     {_stat_box("Total Checked", str(total_seen), "#6b7280")}
-    {_stat_box("Cities", str(len(city_stats)), "#7c3aed")}
+    {_stat_box(section_label.split()[-1], str(len(city_stats)), "#7c3aed")}
     {_stat_box("ScraperAPI Credits", str(total_credits), "#d97706")}
   </div>
 
@@ -162,8 +165,8 @@ def _build_html(
     </tr>
   </table>
 
-  <!-- Per-city breakdown -->
-  <h2 style="font-size:16px;margin:0 0 16px">By City</h2>
+  <!-- Per-city/source breakdown -->
+  <h2 style="font-size:16px;margin:0 0 16px">{section_label}</h2>
   {city_sections}
 
   {error_block}

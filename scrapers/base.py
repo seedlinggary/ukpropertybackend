@@ -23,3 +23,12 @@ class BaseScraper(ABC):
             except Exception:
                 logger.exception("[%s] Failed to scrape %s", self.source, city)
         return all_listings
+
+    # ── Optional tier tracking (implemented by scrapers that support it) ──────
+
+    def reset_tier_stats(self) -> None:
+        """Reset per-tier request counters.  No-op if not overridden."""
+
+    def get_tier_stats(self) -> Dict[str, Any]:
+        """Return a snapshot of per-tier request counters."""
+        return {}

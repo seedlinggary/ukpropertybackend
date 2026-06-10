@@ -630,6 +630,12 @@ from scrapers.base import BaseScraper
 class ZooplaScraper(BaseScraper):
     source = "zoopla"
 
+    def reset_tier_stats(self) -> None:
+        reset_tier_stats()
+
+    def get_tier_stats(self) -> Dict[str, Any]:
+        return get_tier_stats()
+
     def fetch_listings(
         self,
         city: str,

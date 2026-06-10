@@ -25,6 +25,8 @@ class PropertyListing(Base):
     lat = Column(Float)
     lng = Column(Float)
     article4 = Column(Boolean, default=False)
+    auction_date = Column(DateTime, nullable=True)
+    lot_number = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -48,6 +50,8 @@ class PropertyListing(Base):
             "lat": self.lat,
             "lng": self.lng,
             "article4": bool(self.article4),
+            "auction_date": self.auction_date.isoformat() if self.auction_date else None,
+            "lot_number": self.lot_number,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
