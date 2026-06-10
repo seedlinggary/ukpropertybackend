@@ -65,7 +65,7 @@ def start_scheduler() -> None:
 
     _scheduler.add_job(
         func=_scheduled_auction_scrape,
-        trigger=IntervalTrigger(minutes=5),   # every 3 days — auctions update weekly
+        trigger=IntervalTrigger(hours=72),   # every 3 days — auctions update weekly
         id="auction_auto_scrape",
         replace_existing=True,
     )
