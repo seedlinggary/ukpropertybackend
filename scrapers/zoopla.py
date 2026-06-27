@@ -219,41 +219,53 @@ def _scraperapi_get(url: str, api_key: str) -> Optional[str]:
 
 def _schema_items_from_html(html: str) -> List[dict]:
     """
-    Extract listing items from the lsrp-schema __next_s push embedded in HTML.
+    Extract listing items from the lsrp-schema embedded in HTML.
 
-    Zoopla writes:
-      <script>(self.__next_s||[]).push([0, {
-        "type": "application/ld+json",
-        "children": "{ escaped Schema.org JSON }",
-        "id": "lsrp-schema"
-      }])</script>
+    Zoopla has used two formats:
+      New (2026+): <script id="lsrp-schema" type="application/ld+json">{JSON}</script>
+      Old (pre-2026): (self.__next_s||[]).push([0, {"children": "escaped JSON", "id": "lsrp-schema"}])
     """
-    try:
-        marker_idx = html.find('"id":"lsrp-schema"')
-        if marker_idx == -1:
-            return []
-        children_key = '"children":"'
-        key_idx = html.rfind(children_key, max(0, marker_idx - 200_000), marker_idx)
-        if key_idx == -1:
-            return []
-        i = key_idx + len(children_key)
-        chars: List[str] = []
-        while i < len(html):
-            ch = html[i]
-            if ch == "\\":
-                chars.append(ch); chars.append(html[i + 1]); i += 2
-            elif ch == '"':
-                break
-            else:
-                chars.append(ch); i += 1
-        children_str = json.loads('"' + "".join(chars) + '"')
-        data = json.loads(children_str)
+    def _items_from_graph(data: dict) -> List[dict]:
         for node in data.get("@graph", []):
             if node.get("@type") == "SearchResultsPage":
                 elements = node.get("mainEntity", {}).get("itemListElement", [])
                 return [el["item"] for el in elements if el.get("item")]
+        return []
+
+    # New format: direct JSON in a standard ld+json script tag
+    try:
+        m = re.search(r'<script[^>]+id="lsrp-schema"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if m:
+            items = _items_from_graph(json.loads(m.group(1).strip()))
+            if items:
+                return items
     except Exception:
-        logger.debug("[zoopla] schema extraction failed", exc_info=True)
+        logger.debug("[zoopla] schema extraction (new format) failed", exc_info=True)
+
+    # Old format: JSON escaped inside a __next_s push
+    try:
+        marker_idx = html.find('"id":"lsrp-schema"')
+        if marker_idx != -1:
+            children_key = '"children":"'
+            key_idx = html.rfind(children_key, max(0, marker_idx - 200_000), marker_idx)
+            if key_idx != -1:
+                i = key_idx + len(children_key)
+                chars: List[str] = []
+                while i < len(html):
+                    ch = html[i]
+                    if ch == "\\":
+                        chars.append(ch); chars.append(html[i + 1]); i += 2
+                    elif ch == '"':
+                        break
+                    else:
+                        chars.append(ch); i += 1
+                children_str = json.loads('"' + "".join(chars) + '"')
+                items = _items_from_graph(json.loads(children_str))
+                if items:
+                    return items
+    except Exception:
+        logger.debug("[zoopla] schema extraction (old format) failed", exc_info=True)
+
     return []
 
 
@@ -453,7 +465,17 @@ def _full_description_from_html(html: str) -> Optional[str]:
     if best and len(best) >= 200:
         return _clean_text(best)
 
-    # Strategy 2: lsrp-schema __next_s push
+    # Strategy 2: lsrp-schema — new direct format (2026+)
+    try:
+        m2 = re.search(r'<script[^>]+id="lsrp-schema"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if m2:
+            desc = _deepest_description(json.loads(m2.group(1).strip()))
+            if desc and len(desc) > len(best or ""):
+                best = desc
+    except Exception:
+        pass
+
+    # Strategy 2b: lsrp-schema — old __next_s push format (pre-2026)
     try:
         marker_idx = html.find('"id":"lsrp-schema"')
         if marker_idx != -1:

@@ -7,6 +7,7 @@ Uses APScheduler's BackgroundScheduler so it never blocks the Flask process.
 """
 
 import logging
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -56,6 +57,16 @@ def start_scheduler() -> None:
     if _scheduler.running:
         return
 
+    # Run once 30 seconds after startup so every deploy triggers a scrape
+    # (verifies the scraper is working after the deploy completes).
+    _scheduler.add_job(
+        func=_scheduled_zoopla_scrape,
+        trigger="date",
+        run_date=datetime.now() + timedelta(seconds=30),
+        id="zoopla_startup_scrape",
+        replace_existing=True,
+    )
+
     _scheduler.add_job(
         func=_scheduled_zoopla_scrape,
         trigger=IntervalTrigger(hours=24),
@@ -71,7 +82,7 @@ def start_scheduler() -> None:
     )
 
     _scheduler.start()
-    logger.info("[scheduler] Started — Zoopla every 24h, Auctions every 72h")
+    logger.info("[scheduler] Started — Zoopla startup run in 30s, then every 24h; Auctions every 72h")
 
 
 def stop_scheduler() -> None:
