@@ -260,7 +260,8 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
                 score, scored = _best(targeted)
                 print(f"  [epc] targeted: score={score}  → {scored[0].get('addressLine1')!r}")
                 if score > 0:
-                    return {"found": True, "records": scored}
+                    matched = [r for r in scored if _epc_match_score(address, r) > 0]
+                    return {"found": True, "records": matched}
             print(f"  [epc] targeted gave no match — falling back to paginated postcode search")
 
         # ── Stage 2: paginated postcode search ───────────────────────────────
@@ -302,7 +303,9 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
                 return {"found": False, "reason": "no_match",
                         "error": f"No EPC match in {postcode} ({len(all_records)} records searched — "
                                  f"property may use a neighbouring postcode)"}
-            return {"found": True, "records": scored, "postcode_searched": postcode}
+            # Only return records from the same building (filter out score-0 neighbours)
+            matched = [r for r in scored if _epc_match_score(address, r) > 0]
+            return {"found": True, "records": matched, "postcode_searched": postcode}
 
         return {"found": True, "records": all_records, "postcode_searched": postcode}
 
@@ -780,6 +783,14 @@ def _fetch_nearby(lat: float, lng: float) -> dict:
     except Exception as e:
         print(f"  [nearby] EXCEPTION: {e}")
         return {"found": False, "error": str(e)}
+
+
+@property_data_bp.route("/api/epc-detail")
+def get_epc_detail():
+    cert = request.args.get("cert", "").strip()
+    if not cert:
+        return jsonify({"error": "cert param required"}), 400
+    return jsonify(_fetch_epc_detail(cert))
 
 
 @property_data_bp.route("/api/property-data")

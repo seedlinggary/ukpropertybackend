@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CITIES                  = ["london"]
 MAX_LISTINGS_PER_CITY           = 500   # Zoopla default: stop after checking this many per city
 MAX_CONSECUTIVE_DUPES           = 5     # stop after this many back-to-back duplicates
-AUCTION_DEFAULT_MAX_PER_SCRAPER = 100   # default cap for each auction source
+AUCTION_DEFAULT_MAX_PER_SCRAPER = 1000   # default cap for each auction source
 
 # (source, city/category, fetch_details) triples for the 5 auction scrapers
 # Ordered fastest→slowest: allsop (JSON API) → cliveemson/auctionhouse (curl) → savills (browser, no detail) → strettons (browser)
