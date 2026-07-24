@@ -7,7 +7,6 @@ Uses APScheduler's BackgroundScheduler so it never blocks the Flask process.
 """
 
 import logging
-from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -53,19 +52,34 @@ def _scheduled_auction_scrape() -> None:
         logger.exception("[scheduler] Auction scrape failed")
 
 
+def _scheduled_hmlr_refresh() -> None:
+    """Monthly: download latest CCOD/OCOD from HMLR then import into DB."""
+    import os
+    logger.info("[scheduler] Triggered monthly HMLR CCOD/OCOD refresh")
+    if not os.getenv("HMLR_EMAIL") or not os.getenv("HMLR_PASSWORD"):
+        logger.warning("[scheduler] HMLR_EMAIL / HMLR_PASSWORD not set — skipping CCOD refresh")
+        return
+    try:
+        from scripts.download_hmlr import download_datasets
+        download_datasets(import_after=True)
+        logger.info("[scheduler] HMLR refresh complete")
+    except Exception:
+        logger.exception("[scheduler] HMLR refresh failed")
+
+
 def start_scheduler() -> None:
     if _scheduler.running:
         return
 
     # Run once 30 seconds after startup so every deploy triggers a scrape
     # (verifies the scraper is working after the deploy completes).
-    _scheduler.add_job(
-        func=_scheduled_zoopla_scrape,
-        trigger="date",
-        run_date=datetime.now() + timedelta(seconds=30),
-        id="zoopla_startup_scrape",
-        replace_existing=True,
-    )
+    # _scheduler.add_job(
+    #     func=_scheduled_zoopla_scrape,
+    #     trigger="date",
+    #     run_date=datetime.now() + timedelta(seconds=30),
+    #     id="zoopla_startup_scrape",
+    #     replace_existing=True,
+    # )
 
     _scheduler.add_job(
         func=_scheduled_zoopla_scrape,
@@ -81,8 +95,15 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
+    _scheduler.add_job(
+        func=_scheduled_hmlr_refresh,
+        trigger=IntervalTrigger(days=30),    # monthly CCOD/OCOD refresh
+        id="hmlr_monthly_refresh",
+        replace_existing=True,
+    )
+
     _scheduler.start()
-    logger.info("[scheduler] Started — Zoopla startup run in 30s, then every 24h; Auctions every 72h")
+    logger.info("[scheduler] Started — Zoopla every 24h; Auctions every 72h; HMLR every 30 days")
 
 
 def stop_scheduler() -> None:

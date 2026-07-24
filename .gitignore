@@ -17,3 +17,14 @@ venv/
 
 # Mac
 .DS_Store
+
+# Logs
+*.log
+*.log.err
+logs/
+
+# HMLR data files (large CSVs, not for version control)
+data/
+
+# Local scripts (download automation, not for version control)
+scripts/

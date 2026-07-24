@@ -175,6 +175,7 @@ from models import Base  # imports PropertyListing + ScraperRun into Base metada
 from routes.scraper import scraper_bp
 from routes.properties import properties_bp
 from routes.property_data import property_data_bp
+from routes.ownership import ownership_bp
 from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -183,12 +184,16 @@ app = Flask(__name__)
 CORS(app)
 
 # Create new DB tables (property_listings, scraper_runs) if they don't exist yet.
-# The existing polygons table (owned by geoutils.py's Base) is unaffected.
-Base.metadata.create_all(bind=engine)
+# Wrapped in try/except so Flask still starts if the DB is temporarily busy.
+try:
+    Base.metadata.create_all(bind=engine)
+except Exception as _e:
+    logging.getLogger(__name__).warning(f"create_all skipped (DB busy at startup): {_e}")
 
 app.register_blueprint(scraper_bp)
 app.register_blueprint(properties_bp)
 app.register_blueprint(property_data_bp)
+app.register_blueprint(ownership_bp)
 
 # Start the 12-hour background scheduler.
 # Called here (module level) so it runs under gunicorn too, not just `python app.py`.
@@ -309,7 +314,7 @@ def backfill_article4():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, threaded=True)
 # if __name__ == "__main__":
 #     init_db()
 

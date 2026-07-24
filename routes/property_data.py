@@ -146,76 +146,197 @@ def _postcode_from_latlng(lat: float, lng: float):
     return None
 
 
-def _epc_match_score(known_address: str, record: dict) -> int:
+def _epc_match_score(known_address: str, record: dict,
+                     paon=None, saon=None) -> int:
     """
     Score 0–100 for how well an EPC record matches the known address.
-    Returns 0 for definite mismatches (different building numbers).
-    Used to rank multiple records in the same postcode.
+
+    When paon/saon are supplied (from LR structured fields) they are used
+    directly — more reliable than parsing a joined address string because:
+      - saon may be a bare unit number ("3") with no "flat" keyword, which the
+        string parser would mis-identify as the building number
+      - we know definitively whether the LR record is a flat (saon non-empty)
+        or a house (saon empty), enabling flat-presence hard exclusions
+
+    When paon/saon are None the function falls back to parsing known_address
+    (used by the per-property EPC lookup which doesn't have structured fields).
     """
     def _tokens(s: str) -> list:
         return re.sub(r"[^a-z0-9\s]", "", s.lower()).split()
 
-    def _building_num(tokens: list):
-        """
-        Return the likely building number as int, or None.
-        Uses max() so "Flat 3, 145 Lampton Rd" → 145 not 3.
-        Handles alphanumeric house numbers ("143a", "12b") but skips postcode
-        inward codes which share the same pattern: exactly 1 digit + 2 letters
-        (e.g. "4fa" from "TW3 4FA", "3ea" from "SW1 3EA").
-        """
-        nums = []
-        for t in tokens[:8]:
-            if re.match(r"^\d{1,5}$", t):
-                nums.append(int(t))
-            else:
-                m = re.match(r"^(\d{1,5})[a-z]{1,2}$", t)
-                if m:
-                    digits_part = m.group(1)
-                    suffix_part = t[len(digits_part):]
-                    # Skip postcode inward codes: exactly 1 digit + 2 letters
-                    if len(digits_part) == 1 and len(suffix_part) == 2:
-                        continue
-                    nums.append(int(digits_part))
-        return max(nums) if nums else None
+    _FLAT_WORDS = {"flat", "apartment", "apt", "unit", "suite"}
 
-    known = _tokens(known_address)
+    # ── EPC side: always parsed from the address text fields ─────────────────
     epc_raw = " ".join(
         str(record.get(k) or "")
-        for k in ("addressLine1", "addressLine2", "address1", "address2")
+        for k in ("addressLine1", "addressLine2", "addressLine3", "address1", "address2")
     )
     epc = _tokens(epc_raw)
-    if not known or not epc:
+    if not epc:
         return 0
 
-    knum = _building_num(known)
-    enum = _building_num(epc)
+    epc_has_flat_word = any(t in _FLAT_WORDS for t in epc)
 
-    # Hard exclusion: both sides have a building number and they differ.
-    # This catches "143a vs 145" because 143 ≠ 145.
-    if knum is not None and enum is not None and knum != enum:
+    def _parse_identifiers(toks: list):
+        """Parse (building_base, building_suffix, unit_label) from a token list."""
+        unit_label = None
+        excluded: set = set()
+        for i, t in enumerate(toks[:7]):
+            if t in _FLAT_WORDS and i + 1 < len(toks):
+                unit_label = toks[i + 1].lower()
+                excluded.update({i, i + 1})
+                break
+        base, suf = None, ""
+        for i, t in enumerate(toks[:10]):
+            if i in excluded:
+                continue
+            if re.match(r"^\d{1,5}$", t):
+                base, suf = int(t), ""
+                break
+            m = re.match(r"^(\d{1,5})([a-z]{1,2})$", t)
+            if m:
+                d, s2 = m.group(1), m.group(2)
+                if len(d) == 1 and len(s2) == 2:
+                    continue
+                base, suf = int(d), s2
+                break
+        if base is None and unit_label is not None:
+            unit_label = None
+            for t in toks[:10]:
+                if re.match(r"^\d{1,5}$", t):
+                    base, suf = int(t), ""
+                    break
+                m = re.match(r"^(\d{1,5})([a-z]{1,2})$", t)
+                if m:
+                    d, s2 = m.group(1), m.group(2)
+                    if not (len(d) == 1 and len(s2) == 2):
+                        base, suf = int(d), s2
+                        break
+        return base, suf, unit_label
+
+    ebase, esuf, eunit = _parse_identifiers(epc)
+
+    # ── LR (known) side ───────────────────────────────────────────────────────
+    structured = paon is not None  # caller provided structured LR fields
+    if structured:
+        # Parse building number from paon ("15" -> 15, "25A" -> 25+a,
+        # "CENTRAL HOUSE" -> None).  Ignore postcode-style codes (e.g. "3QY").
+        paon_toks = _tokens(paon or "")
+        kbase, ksuf = None, ""
+        for t in paon_toks:
+            if re.match(r"^\d{1,5}$", t):
+                kbase, ksuf = int(t), ""
+                break
+            m = re.match(r"^(\d{1,5})([a-z]{1,2})$", t)
+            if m:
+                d, s2 = m.group(1), m.group(2)
+                if not (len(d) == 1 and len(s2) == 2):
+                    kbase, ksuf = int(d), s2
+                    break
+
+        # Extract unit from saon — saon="" means house (no sub-unit).
+        # saon may be: "FLAT F", "FLAT 3", "3" (bare number), "F" (bare letter),
+        # "APARTMENT 4B", "GROUND FLOOR", "BASEMENT".
+        saon_str = (saon or "").strip()
+        saon_toks = _tokens(saon_str)
+        kunit = None
+        if saon_toks:
+            if saon_toks[0] in _FLAT_WORDS and len(saon_toks) > 1:
+                kunit = saon_toks[1].lower()          # "FLAT F" -> "f"
+            else:
+                kunit = " ".join(saon_toks).lower()   # "3" -> "3", "GROUND FLOOR" -> "ground floor"
+
+        # Handle legacy paon like "FLAT 3, 15" where flat info is in paon
+        if kunit is None and paon_toks:
+            for i, t in enumerate(paon_toks[:5]):
+                if t in _FLAT_WORDS and i + 1 < len(paon_toks):
+                    kunit = paon_toks[i + 1].lower()
+                    excl = {i, i + 1}
+                    kbase, ksuf = None, ""
+                    for j, t2 in enumerate(paon_toks):
+                        if j in excl:
+                            continue
+                        if re.match(r"^\d{1,5}$", t2):
+                            kbase, ksuf = int(t2), ""
+                            break
+                        m2 = re.match(r"^(\d{1,5})([a-z]{1,2})$", t2)
+                        if m2:
+                            d2, s3 = m2.group(1), m2.group(2)
+                            if not (len(d2) == 1 and len(s3) == 2):
+                                kbase, ksuf = int(d2), s3
+                                break
+                    break
+    else:
+        # Fallback: parse the pre-joined address string (used by non-street EPC lookups)
+        known = _tokens(known_address)
+        if not known:
+            return 0
+        kbase, ksuf, kunit = _parse_identifiers(known)
+
+    # ── Hard exclusions ────────────────────────────────────────────────────────
+
+    # 1. Building numbers differ (13 vs 15)
+    if kbase is not None and ebase is not None and kbase != ebase:
         return 0
 
-    # Distinctive word overlap (skip generic UK address vocabulary)
+    # 2. Building suffixes differ (25A vs 25C)
+    if kbase is not None and ebase is not None and kbase == ebase:
+        if ksuf and esuf and ksuf != esuf:
+            return 0
+
+    # 3–5 below use flat-presence knowledge only available in structured mode
+    # (in fallback mode we keep the original looser logic to avoid regressions)
+    if structured:
+        # Is kunit a "precise" identifier — single letter, digit, or short
+        # alphanumeric like "f", "3", "4b"?  Contrasted with descriptors like
+        # "ground floor" or "basement" which can't be confirmed against EPC text.
+        kunit_precise = (kunit is not None and
+                         bool(re.match(r"^[a-z0-9]{1,4}$", kunit)))
+
+        if kunit_precise:
+            # LR identifies a specific flat unit precisely.
+            # EPC MUST also have an explicit matching unit — floor descriptors
+            # ("Ground Floor Flat") and whole-building certs are rejected.
+            if not epc_has_flat_word:
+                return 0   # LR=flat, EPC=house/whole-building cert
+            if eunit is None or eunit != kunit:
+                return 0   # EPC is a flat but unit unconfirmable or different
+        elif kunit is not None:
+            # LR has a descriptor saon ("GROUND FLOOR", "BASEMENT").
+            # EPC must at least be some kind of flat cert.
+            if not epc_has_flat_word:
+                return 0
+        else:
+            # LR has no sub-unit (saon="") → this is a house/whole-building sale.
+            # Reject any EPC cert that describes a specific flat.
+            if epc_has_flat_word:
+                return 0
+    else:
+        # Fallback mode: original rule — both have labels and they differ
+        if kunit is not None and eunit is not None and kunit != eunit:
+            return 0
+
+    # ── Scoring ────────────────────────────────────────────────────────────────
     _SKIP = {
         "flat", "floor", "ground", "first", "second", "third",
         "road", "street", "avenue", "close", "drive", "lane", "way",
         "place", "grove", "gardens", "court", "house", "and", "the",
+        "apartment", "apt", "unit", "suite",
     }
-    kwords = {t for t in known if len(t) > 2 and not re.match(r"^\d", t) and t not in _SKIP}
-    ewords = {t for t in epc   if len(t) > 2 and not re.match(r"^\d", t) and t not in _SKIP}
+    ref_toks = (_tokens(" ".join(filter(None, [saon or "", paon or ""])))
+                if structured else _tokens(known_address))
+    kwords = {t for t in ref_toks if len(t) > 2 and not re.match(r"^\d", t) and t not in _SKIP}
+    ewords = {t for t in epc      if len(t) > 2 and not re.match(r"^\d", t) and t not in _SKIP}
     overlap = kwords & ewords
 
     score = 0
-    if knum is not None and enum is not None and knum == enum:
-        # Building numbers match — award number match + distinctive word overlap
+    if kbase is not None and ebase is not None and kbase == ebase:
         score += 40
         if overlap:
             score += min(len(overlap) * 25, 60)
-    elif knum is None and overlap:
-        # Searched address has no house number — word overlap only (best we can do)
+    elif kbase is None and overlap:
         score += min(len(overlap) * 25, 60)
-    # When knum is known but enum is None or differs, score stays 0.
-    # This prevents "LAMPTON COURT" (no number) scoring 25 against "145 Lampton Road".
+
     return min(score, 100) if score else 0
 
 
@@ -230,7 +351,7 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
     def _api_get(params: dict) -> list:
         try:
             r = requests.get(api_url, params=params, headers=headers, timeout=TIMEOUT)
-            print(f"  [epc] GET {params} → {r.status_code}")
+            print(f"  [epc] GET {params} status={r.status_code}")
             if r.ok:
                 data = (r.json() or {}).get("data", [])
                 # API returns {"data": {"error": "..."}} (a dict, not a list) when no
@@ -258,7 +379,7 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
             targeted = _api_get({"postcode": postcode, "address": street_part, "size": 5})
             if targeted:
                 score, scored = _best(targeted)
-                print(f"  [epc] targeted: score={score}  → {scored[0].get('addressLine1')!r}")
+                print(f"  [epc] targeted: score={score}  addr={scored[0].get('addressLine1')!r}")
                 if score > 0:
                     matched = [r for r in scored if _epc_match_score(address, r) > 0]
                     return {"found": True, "records": matched}
@@ -298,7 +419,7 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
 
         if address:
             score, scored = _best(all_records)
-            print(f"  [epc] final: score={score}  → {scored[0].get('addressLine1')!r}")
+            print(f"  [epc] final: score={score}  addr={scored[0].get('addressLine1')!r}")
             if score == 0:
                 return {"found": False, "reason": "no_match",
                         "error": f"No EPC match in {postcode} ({len(all_records)} records searched — "
@@ -918,3 +1039,291 @@ def get_property_data():
         }
         print(f"  returning response for postcode={postcode!r}")
         return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Street-level sales drill-down
+# ---------------------------------------------------------------------------
+
+def _parse_street_and_district(address: str, postcode: str) -> tuple:
+    """
+    Extract (street_name_upper, town_upper, district_upper) from a full
+    address string and postcode.
+
+    e.g. "7 Westcott Road, Southwark, London, SE17 3QY"
+         postcode "SE17 3QY"
+    →   ("WESTCOTT ROAD", "SOUTHWARK", "SE17")
+    """
+    # --- postcode district ---
+    pc_clean = re.sub(r"\s+", "", (postcode or "")).upper()
+    district = re.match(r"^([A-Z]{1,2}\d{1,2}[A-Z]?)", pc_clean)
+    district = district.group(1) if district else ""
+
+    # --- street name: strip leading house number from first comma-part ---
+    first_part = (address.split(",")[0] if "," in address else address).strip()
+    street = re.sub(r"^\d+[a-zA-Z]?\s+", "", first_part).strip()  # remove "7 " or "14A "
+    # handle "Flat 3, 7 Kings Road" → first part is "Flat 3" — try second part
+    if len(street.split()) <= 1 and "," in address:
+        second_part = address.split(",")[1].strip()
+        street = re.sub(r"^\d+[a-zA-Z]?\s+", "", second_part).strip()
+
+    # --- town: second non-empty comma-part that isn't a postcode / country ---
+    parts = [p.strip() for p in address.split(",")]
+    town = ""
+    skip = {"united kingdom", "england", "wales", "scotland"}
+    pc_re = re.compile(r"^[A-Z]{1,2}\d", re.IGNORECASE)
+    for p in parts[1:]:
+        if not p or p.lower() in skip or pc_re.match(p):
+            continue
+        town = p
+        break
+
+    return street.upper(), town.upper(), district.upper()
+
+
+def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict:
+    """
+    Fetch all Land Registry sales for a given street name, then batch-match
+    EPC records (by postcode) to append floor_area_m2 and price_per_m2.
+    """
+    print(f"  [street] fetching street={street!r}  town={town!r}  district={district!r}")
+
+    # ── Step 1: Query Land Registry ───────────────────────────────────────
+    params: dict = {
+        "propertyAddress.street": street,
+        "_pageSize": 100,
+        "_sort": "-transactionDate",
+        "_page": 0,
+    }
+    if town:
+        params["propertyAddress.town"] = town
+
+    all_items: list = []
+    for page_num in range(3):          # max 300 results
+        params["_page"] = page_num
+        try:
+            r = requests.get(
+                "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
+                params=params,
+                headers={"Accept": "application/json"},
+                timeout=TIMEOUT,
+            )
+            print(f"  [street] LR page={page_num} status={r.status_code}")
+            if not r.ok:
+                break
+            items = (r.json() or {}).get("result", {}).get("items", [])
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+        except Exception as exc:
+            print(f"  [street] LR error: {exc}")
+            break
+
+    if not all_items:
+        # Try without town filter if we got nothing (LR data can have different town names)
+        if town:
+            params_no_town = {k: v for k, v in params.items()
+                              if k != "propertyAddress.town"}
+            params_no_town["_page"] = 0
+            try:
+                r = requests.get(
+                    "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
+                    params=params_no_town,
+                    headers={"Accept": "application/json"},
+                    timeout=TIMEOUT,
+                )
+                if r.ok:
+                    all_items = (r.json() or {}).get("result", {}).get("items", [])
+                    print(f"  [street] fallback (no town): {len(all_items)} items")
+            except Exception:
+                pass
+
+    if not all_items:
+        return {"found": False, "sales": [], "stats": {}, "street": street,
+                "error": "No sales found for this street in Land Registry"}
+
+    # Post-filter by postcode district to avoid results from streets with the
+    # same name in other cities (e.g. there are many "Victoria Road"s in England)
+    if district:
+        filtered = []
+        for item in all_items:
+            addr = item.get("propertyAddress") or {}
+            def _s(v):
+                return _lr_val(v) if isinstance(v, dict) else v
+            pc = str(_s(addr.get("postcode")) or "").replace(" ", "").upper()
+            if pc.startswith(district.upper()):
+                filtered.append(item)
+        if filtered:
+            all_items = filtered
+            print(f"  [street] after district filter ({district}): {len(all_items)} items")
+
+    # ── Step 2: Parse into sale dicts ─────────────────────────────────────
+    sales: list = []
+    for item in all_items:
+        addr = item.get("propertyAddress") or {}
+
+        def _s(v):
+            return _lr_val(v) if isinstance(v, dict) else v
+
+        paon     = str(_s(addr.get("paon"))   or "")
+        saon     = str(_s(addr.get("saon"))   or "")
+        street_n = str(_s(addr.get("street")) or "")
+        town_n   = str(_s(addr.get("town"))   or "")
+        postcode = str(_s(addr.get("postcode")) or "")
+        raw_type   = str(_lr_val(item.get("propertyType")) or "")
+        raw_tenure = str(_lr_val(item.get("estateType"))   or "")
+        raw_cat    = str(_lr_val(item.get("transactionCategory")) or "")
+
+        # saon first so "FLAT F, 6, WESTCOTT ROAD" matches EPC format
+        parts = [p for p in [saon, paon, street_n, town_n] if p]
+        full_address = ", ".join(parts)
+
+        sales.append({
+            "price":         _s(item.get("pricePaid")),
+            "date":          _parse_lr_date(str(item.get("transactionDate") or "")),
+            "type":          _PROP_TYPE.get(raw_type, raw_type.title() if raw_type else ""),
+            "tenure":        _TENURE.get(raw_tenure, raw_tenure.title() if raw_tenure else ""),
+            "new_build":     _s(item.get("newBuild")),
+            "category":      "Additional" if "additional" in raw_cat.lower() else "Standard",
+            "address":       full_address,
+            "paon":          paon,
+            "saon":          saon,
+            "postcode":      postcode,
+            "floor_area_m2": None,
+            "price_per_m2":  None,
+        })
+
+    # ── Step 3: Batch EPC lookup per unique postcode ──────────────────────
+    unique_postcodes = {s["postcode"] for s in sales if s["postcode"]}
+
+    def _epc_for_postcode(pc: str) -> tuple:
+        try:
+            result = _fetch_epc(pc, address="")
+            return pc, result.get("records", []) if result.get("found") else []
+        except Exception:
+            return pc, []
+
+    epc_by_postcode: dict = {}
+    if unique_postcodes:
+        with ThreadPoolExecutor(max_workers=min(8, len(unique_postcodes))) as pool:
+            for pc, records in pool.map(_epc_for_postcode, unique_postcodes):
+                epc_by_postcode[pc] = records
+        print(f"  [street] EPC fetched for {len(epc_by_postcode)} postcodes")
+
+    # ── Step 4: Match each sale to its best EPC cert number ──────────────
+    # The 2025 MHCLG EPC API returns no floor area fields; we must scrape
+    # the GOV.UK certificate page (_fetch_epc_detail) for each matched cert.
+    cert_for_sale: list = [None] * len(sales)
+    epc_addr_for_sale: list = [""] * len(sales)   # matched EPC address for tooltip
+    for idx, sale in enumerate(sales):
+        pc = sale.get("postcode", "")
+        records = epc_by_postcode.get(pc, [])
+        if not records:
+            continue
+        best_score, best_cert, best_rec_obj = 0, None, None
+        for rec in records:
+            sc = _epc_match_score(sale["address"], rec,
+                                  paon=sale["paon"], saon=sale["saon"])
+            if sc > best_score:
+                best_score = sc
+                best_cert = rec.get("certificateNumber") or rec.get("lmkKey")
+                best_rec_obj = rec
+        if best_cert and best_score > 0:
+            cert_for_sale[idx] = best_cert
+            # Build readable EPC address for the hover tooltip
+            epc_addr_for_sale[idx] = ", ".join(
+                v for k in ("addressLine1", "addressLine2", "addressLine3", "postcode")
+                if (v := str(best_rec_obj.get(k) or "").strip())
+            )
+
+    # ── Step 5: Batch-scrape EPC detail pages for unique matched certs ────
+    unique_certs = {c for c in cert_for_sale if c}
+    cert_detail: dict = {}
+    if unique_certs:
+        def _get_detail(cert):
+            return cert, _fetch_epc_detail(cert)
+        with ThreadPoolExecutor(max_workers=min(5, len(unique_certs))) as pool:
+            for cert, detail in pool.map(_get_detail, unique_certs):
+                cert_detail[cert] = detail
+        print(f"  [street] scraped EPC detail for {len(cert_detail)} unique certs")
+
+    # ── Step 6: Apply floor area + EPC metadata to each sale ─────────────
+    for idx, sale in enumerate(sales):
+        cert = cert_for_sale[idx]
+        if not cert:
+            continue
+        detail = cert_detail.get(cert, {})
+        area = detail.get("floor_area_m2")
+        if area and area > 0:
+            sale["floor_area_m2"] = area
+            price = sale.get("price")
+            if isinstance(price, (int, float)):
+                sale["price_per_m2"] = round(price / area)
+        if detail.get("found"):
+            sale["epc_cert"]           = cert
+            sale["epc_address"]        = epc_addr_for_sale[idx]
+            sale["epc_floor_area_raw"] = detail.get("floor_area_raw")
+            sale["epc_property_type"]  = detail.get("property_type_epc")
+            sale["epc_built_form"]     = detail.get("built_form")
+            sale["epc_habitable_rooms"] = detail.get("habitable_rooms")
+
+    # ── Step 7: Compute statistics ────────────────────────────────────────
+    prices     = [s["price"] for s in sales if isinstance(s.get("price"), (int, float))]
+    sqm_sales  = [s for s in sales if s.get("price_per_m2")]
+    sqm_values = [s["price_per_m2"] for s in sqm_sales]
+
+    # Rolling average: chronologically last 8 sales that have area data
+    recent_sqm = sorted(sqm_sales, key=lambda s: s.get("date", ""))[-8:]
+    rolling_avg_sqm = (
+        round(sum(s["price_per_m2"] for s in recent_sqm) / len(recent_sqm))
+        if recent_sqm else None
+    )
+
+    median_price = None
+    if prices:
+        sp = sorted(prices)
+        n = len(sp)
+        median_price = sp[n // 2] if n % 2 else (sp[n // 2 - 1] + sp[n // 2]) // 2
+
+    avg_sqm = round(sum(sqm_values) / len(sqm_values)) if sqm_values else None
+
+    # Distinct paon+saon combos = unique properties
+    unique_props = len({(s["paon"], s["saon"]) for s in sales})
+
+    stats = {
+        "total_sales":    len(sales),
+        "unique_props":   unique_props,
+        "median_price":   median_price,
+        "avg_sqm":        avg_sqm,
+        "rolling_avg_sqm": rolling_avg_sqm,
+        "sqm_coverage":   len(sqm_sales),
+        "sqm_missing":    len(sales) - len(sqm_sales),
+    }
+
+    print(f"  [street] done: {len(sales)} sales, {len(sqm_sales)} with area")
+    return {
+        "found":  True,
+        "street": street,
+        "stats":  stats,
+        "sales":  sales,
+    }
+
+
+@property_data_bp.route("/api/street-sales")
+def get_street_sales():
+    """
+    GET /api/street-sales?address=<full_address>&postcode=<postcode>
+    The backend parses the street name + town from the address string.
+    """
+    address  = request.args.get("address",  "").strip()
+    postcode = request.args.get("postcode", "").strip()
+
+    if not address:
+        return jsonify({"error": "address param required"}), 400
+
+    street, town, district = _parse_street_and_district(address, postcode)
+    if not street:
+        return jsonify({"error": "Could not parse street name from address"}), 400
+
+    result = _fetch_street_sales(street, town, district)
+    return jsonify(result)
