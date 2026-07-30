@@ -11,10 +11,12 @@ Aggregates free UK property data in parallel:
   - OpenStreetMap Overpass (nearby schools, transport, shops, GPs, parks)
 """
 
+import hashlib
 import logging
 import math
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Blueprint, jsonify, request
@@ -32,6 +34,14 @@ property_data_bp = Blueprint("property_data", __name__)
 
 EPC_BEARER = os.getenv("EPC_BEARER_TOKEN", "")
 TIMEOUT = 8
+
+# ---------------------------------------------------------------------------
+# In-memory response cache: keyed by (lat 3dp, lng 3dp) → property data dict
+# 3 decimal places ≈ 110m precision, which is fine for postcode-level lookups.
+# Capped at 200 entries; evicts the 20 oldest when full.
+# ---------------------------------------------------------------------------
+_PROP_DATA_CACHE: dict[str, tuple] = {}  # key → (result_dict, timestamp)
+_PROP_DATA_TTL = 600  # 10 minutes
 
 # ---------------------------------------------------------------------------
 # Land Registry helpers
@@ -391,7 +401,7 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
         all_records: list = []
         seen_keys: set = set()
 
-        for offset in range(0, 100, 25):
+        for offset in range(0, 50, 25):  # 2 pages × 25 = 50 records (enough for most postcodes)
             page = _api_get({"postcode": postcode, "size": 25, "from": offset})
             new_count = 0
             for rec in page:
@@ -848,7 +858,7 @@ def _fetch_nearby(lat: float, lng: float) -> dict:
     r = None
     for endpoint in _OVERPASS_ENDPOINTS:
         try:
-            r = requests.get(endpoint, params={"data": query}, timeout=14)
+            r = requests.get(endpoint, params={"data": query}, timeout=8)
             print(f"  [nearby] {endpoint.split('/')[2]} status={r.status_code}")
             if r.ok:
                 break
@@ -925,6 +935,18 @@ def get_property_data():
         return jsonify({"error": "lat and lng query params required"}), 400
 
     print(f"  lat={lat}  lng={lng}")
+
+    # Check in-memory cache.
+    # Key = rounded coords + address hint hash so two different properties
+    # that are close together (within 110 m) don't share the same EPC match.
+    _addr_hint_raw = request.args.get("address", "").strip().lower()
+    _addr_hash = hashlib.md5(_addr_hint_raw.encode()).hexdigest()[:8]
+    _cache_key = f"{round(lat, 3)},{round(lng, 3)},{_addr_hash}"
+    _now = time.time()
+    _cached = _PROP_DATA_CACHE.get(_cache_key)
+    if _cached and (_now - _cached[1]) < _PROP_DATA_TTL:
+        print(f"  [cache HIT] {_cache_key}")
+        return jsonify(_cached[0])
 
     # Optional address hint — used to rank EPC records so the correct property surfaces first
     address_hint = request.args.get("address", "").strip()
@@ -1037,6 +1059,14 @@ def get_property_data():
             "nearby":      safe(f_nearby,      "nearby"),
             "council_tax": safe(f_council_tax, "ctax")     if f_council_tax else {"found": False},
         }
+
+        # Store in cache; evict oldest 20 entries when cap exceeded
+        if len(_PROP_DATA_CACHE) >= 200:
+            oldest = sorted(_PROP_DATA_CACHE, key=lambda k: _PROP_DATA_CACHE[k][1])[:20]
+            for k in oldest:
+                del _PROP_DATA_CACHE[k]
+        _PROP_DATA_CACHE[_cache_key] = (result, time.time())
+
         print(f"  returning response for postcode={postcode!r}")
         return jsonify(result)
 

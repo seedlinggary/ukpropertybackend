@@ -321,60 +321,133 @@ def suggest_ownership():
     return jsonify({"suggestions": [{"name": r[0], "title_count": int(r[1])} for r in rows]})
 
 
+_UK_PC_RE = re.compile(r'\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b', re.IGNORECASE)
+
+
+def _extract_house_number(address: str) -> str | None:
+    """
+    Pull the primary building number out of a UK address string.
+    Strips flat/floor/unit prefixes so "Flat 3, 53 High St" → "53".
+    Returns None if no number can be found (e.g. named buildings like "Knightsbridge Court").
+    """
+    if not address:
+        return None
+    stripped = re.sub(
+        r'^(flat|apartment|unit|floor|suite|room|ground floor|first floor|'
+        r'second floor|third floor|lower ground|upper ground)\s+\S+[,\s]+',
+        "", address.strip(), flags=re.IGNORECASE,
+    ).strip()
+    m = re.match(r'^(\d+[a-zA-Z]?)', stripped)
+    return m.group(1) if m else None
+
+
+def _extract_postcode(address: str) -> str | None:
+    """Extract a formatted UK postcode from a free-text address string (e.g. Mapbox place_name)."""
+    if not address:
+        return None
+    m = _UK_PC_RE.search(address)
+    if not m:
+        return None
+    raw = m.group(1).upper().replace(" ", "")
+    return (raw[:-3] + " " + raw[-3:]) if len(raw) >= 5 else None
+
+
+def _run_ownership_query(conn, sql_template: str, params: dict) -> list:
+    return conn.execute(text(sql_template), params).fetchall()
+
+
 @ownership_bp.route("/api/ownership/by-address")
 @_db_retry()
 def ownership_by_address():
-    """Find companies owning a title at the given postcode (for the map-click ownership lookup)."""
+    """Find companies owning a title at the given postcode (for the map-click ownership lookup).
+
+    Strategy (in priority order):
+    1. Query the property-data postcode filtered to the house number from the address hint.
+    2. Also query any different postcode embedded in the address hint (Mapbox place_name
+       includes the postcode — e.g. "Knightsbridge Court, Sloane Street, London SW1X 9LQ").
+       This catches the common case where the EPC postcode differs from the HMLR postcode.
+    3. Deduplicate results by title_number.
+    4. If nothing is found after steps 1+2, fall back to the full unfiltered postcode set.
+    """
     _ensure_table()
-    raw = request.args.get("postcode", "").strip().upper().replace(" ", "")
+    raw          = request.args.get("postcode", "").strip().upper().replace(" ", "")
+    address_hint = request.args.get("address",  "").strip()
 
     if not raw:
         return jsonify({"matches": []})
 
-    # Reinsert the space in standard UK postcode format (e.g. "YO16DY" → "YO1 6DY")
-    # so the query hits the btree index on the postcode column instead of doing
-    # a full 4.5M-row scan with REPLACE(UPPER(postcode),' ','').
-    formatted = (raw[:-3] + " " + raw[-3:]) if len(raw) >= 5 else raw
+    formatted     = (raw[:-3] + " " + raw[-3:]) if len(raw) >= 5 else raw
+    house_num     = _extract_house_number(address_hint)
+    address_pc    = _extract_postcode(address_hint)   # postcode embedded in Mapbox place_name
+
+    # All postcodes to search — deduplicated, both are indexed so cost is low
+    postcodes = list(dict.fromkeys(pc for pc in [formatted, address_pc] if pc))
+
+    _BASE_SQL = """
+        SELECT
+            title_number,
+            tenure,
+            MIN(address)                                              AS address,
+            source,
+            MAX(date_added)::text                                     AS date_added,
+            COUNT(*)                                                  AS proprietor_count,
+            STRING_AGG(company_name,    ' | ' ORDER BY company_name) AS company_names,
+            STRING_AGG(COALESCE(company_number,''), ' | '
+                       ORDER BY company_name)                         AS company_numbers,
+            MIN(proprietor_cat)                                       AS proprietor_cat,
+            MIN(country)                                              AS country
+        FROM company_ownership
+        WHERE postcode = ANY(:pcs) {extra}
+        GROUP BY title_number, tenure, source
+        ORDER BY
+            CASE WHEN tenure ILIKE 'f%%' THEN 0 ELSE 1 END,
+            MAX(date_added) DESC NULLS LAST,
+            title_number
+        LIMIT 20
+    """
 
     try:
         with engine.connect() as conn:
             conn.execute(text("SET statement_timeout = 0"))
-            # Group by company + tenure so a block of flats with one company
-            # holding 9 leasehold titles shows as a single row with title_count=9
-            # rather than 9 identical-looking boxes in the UI.
-            rows = conn.execute(text("""
-                SELECT
-                    company_name,
-                    company_number,
-                    proprietor_cat,
-                    country,
-                    COUNT(*)          AS title_count,
-                    MIN(title_number) AS title_number,
-                    tenure,
-                    MIN(address)      AS address,
-                    source
-                FROM company_ownership
-                WHERE postcode = :pc
-                GROUP BY company_name, company_number, proprietor_cat, country, tenure, source
-                ORDER BY title_count DESC, company_name
-                LIMIT 20
-            """), {"pc": formatted}).fetchall()
+
+            filtered = False
+            if house_num:
+                num_space = f"{house_num} %"
+                num_comma = f"{house_num},%"
+                num_mid   = f"%, {house_num} %"
+                extra_clause = (
+                    "AND (address ILIKE :ns OR address ILIKE :nc OR address ILIKE :nm)"
+                )
+                rows = _run_ownership_query(conn, _BASE_SQL.format(extra=extra_clause), {
+                    "pcs": postcodes, "ns": num_space, "nc": num_comma, "nm": num_mid,
+                })
+                if rows:
+                    filtered = True
+                else:
+                    rows = _run_ownership_query(conn, _BASE_SQL.format(extra=""), {"pcs": postcodes})
+            else:
+                rows = _run_ownership_query(conn, _BASE_SQL.format(extra=""), {"pcs": postcodes})
 
         matches = [
             {
-                "company_name":   r[0],
-                "company_number": r[1],
-                "proprietor_cat": r[2],
-                "country":        r[3],
-                "title_count":    int(r[4]),
-                "title_number":   r[5],
-                "tenure":         r[6],
-                "address":        r[7],
-                "source":         r[8],
+                "title_number":     r[0],
+                "tenure":           r[1],
+                "address":          r[2],
+                "source":           r[3],
+                "date_added":       r[4],
+                "proprietor_count": int(r[5]),
+                "company_names":    [n.strip() for n in (r[6] or "").split("|") if n.strip()],
+                "company_numbers":  [n.strip() or None for n in (r[7] or "").split("|")],
+                "proprietor_cat":   r[8],
+                "country":          r[9],
             }
             for r in rows
         ]
-        return jsonify({"matches": matches, "postcode": formatted})
+        return jsonify({
+            "matches":  matches,
+            "postcode": formatted,
+            "filtered": filtered,   # True = matched by house number; False = full postcode fallback
+        })
     except Exception as exc:
         logger.exception("[ownership] by-address error")
         return jsonify({"matches": [], "error": str(exc)})
