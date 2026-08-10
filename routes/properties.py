@@ -118,6 +118,15 @@ def list_properties():
             if search:
                 q = _keyword_filter(q, search)
 
+            postcode_exact = request.args.get("postcode_exact", "").strip().upper()
+            if postcode_exact:
+                normalised = " ".join(postcode_exact.split())
+                q = q.filter(PropertyListing.postcode.ilike(normalised))
+
+            tenure = request.args.get("tenure", "").strip().lower()
+            if tenure:
+                q = q.filter(PropertyListing.tenure == tenure)
+
             lat = request.args.get("lat", type=float)
             lng = request.args.get("lng", type=float)
             radius_km = request.args.get("radius_km", 5.0, type=float)
@@ -144,7 +153,7 @@ def list_properties():
             is_filtered = any([
                 article4, min_price, max_price, min_beds,
                 min_size, max_size, source, city,
-                property_type, keyword, search, lat is not None,
+                property_type, keyword, search, postcode_exact, tenure, lat is not None,
             ])
 
             if not is_filtered:

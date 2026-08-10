@@ -13,6 +13,8 @@ class PropertyListing(Base):
     listing_url = Column(String(1000), unique=True, nullable=False, index=True)
     city = Column(String(100), index=True)
     address = Column(String(500))
+    postcode = Column(String(20), index=True)
+    street = Column(String(200))
     price = Column(Integer)
     bedrooms = Column(Integer)
     bathrooms = Column(Integer)
@@ -25,6 +27,7 @@ class PropertyListing(Base):
     lat = Column(Float)
     lng = Column(Float)
     article4 = Column(Boolean, default=False)
+    tenure = Column(String(50), nullable=True)   # freehold | leasehold | share_of_freehold
     auction_date = Column(DateTime, nullable=True)
     lot_number = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -38,6 +41,8 @@ class PropertyListing(Base):
             "listing_url": self.listing_url,
             "city": self.city,
             "address": self.address,
+            "postcode": self.postcode,
+            "street": self.street,
             "price": self.price,
             "bedrooms": self.bedrooms,
             "bathrooms": self.bathrooms,
@@ -50,6 +55,7 @@ class PropertyListing(Base):
             "lat": self.lat,
             "lng": self.lng,
             "article4": bool(self.article4),
+            "tenure": self.tenure,
             "auction_date": self.auction_date.isoformat() if self.auction_date else None,
             "lot_number": self.lot_number,
             "created_at": self.created_at.isoformat() if self.created_at else None,

@@ -26,6 +26,7 @@ import os
 import random
 import re
 import time
+import requests
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -604,6 +605,109 @@ def _prop_type(schema_type: str, name: str) -> Optional[str]:
     return schema_type.lower() or None
 
 
+def _reverse_geocode(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
+    """
+    Return (postcode, street) for lat/lng via Nominatim.
+    Falls back to (None, None) on any error.
+    """
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"format": "json", "lat": lat, "lon": lng, "zoom": 18, "addressdetails": 1},
+            headers={"User-Agent": "ukPropertyWebsite/1.0"},
+            timeout=5,
+        )
+        addr = r.json().get("address", {})
+        postcode = addr.get("postcode")
+        street   = addr.get("road") or addr.get("pedestrian") or addr.get("path")
+        return postcode, street
+    except Exception:
+        pass
+    return None, None
+
+
+def _tenure(item: dict) -> Optional[str]:
+    """
+    Extract tenure from the listing name or description.
+    Order matters: check 'share of freehold' before 'freehold'.
+    """
+    text = " ".join([
+        item.get("name") or "",
+        item.get("description") or "",
+    ]).lower()
+    if "share of freehold" in text or "share-of-freehold" in text:
+        return "share_of_freehold"
+    if "freehold" in text:
+        return "freehold"
+    if "leasehold" in text:
+        return "leasehold"
+    return None
+
+
+def _extra_suffix(item: dict, related: dict, offers: dict) -> str:
+    """
+    Build a structured data suffix from schema fields not stored in their own columns.
+    Appended to the description so the data is preserved and searchable via keyword.
+    """
+    parts: list[str] = []
+
+    # Listing date
+    date_posted = item.get("datePosted") or item.get("dateCreated")
+    if date_posted:
+        parts.append(f"Date Listed: {date_posted}")
+
+    # Agent — stored in proper columns AND included here for searchability
+    seller = offers.get("seller") or {}
+    if isinstance(seller, list):
+        seller = seller[0] if seller else {}
+    agent_name  = seller.get("name") or seller.get("tradeName")
+    agent_phone = seller.get("telephone")
+    if agent_name:
+        parts.append(f"Agent: {agent_name}")
+    if agent_phone:
+        parts.append(f"Agent Phone: {agent_phone}")
+
+    # Room count
+    num_rooms = related.get("numberOfRooms")
+    if num_rooms is not None:
+        parts.append(f"Total Rooms: {num_rooms}")
+
+    # Floor level (useful for flats)
+    floor_level = related.get("floorLevel")
+    if floor_level is not None:
+        parts.append(f"Floor: {floor_level}")
+
+    # Development / building name
+    is_part_of = related.get("isPartOf") or {}
+    if isinstance(is_part_of, dict):
+        building = is_part_of.get("name")
+        if building:
+            parts.append(f"Building: {building}")
+
+    # Amenity features (garden, parking, balcony, lift, …)
+    features = related.get("amenityFeature") or []
+    if isinstance(features, list) and features:
+        names: list[str] = []
+        for feat in features:
+            if not isinstance(feat, dict):
+                continue
+            name = feat.get("name") or feat.get("value")
+            val  = feat.get("value")
+            if not name:
+                continue
+            # Include only features flagged as present/true
+            if val is True or (isinstance(val, str) and val.lower() not in ("false", "no", "0", "")):
+                names.append(str(name))
+            elif isinstance(val, (int, float)) and val > 0:
+                names.append(f"{name}: {val}")
+        if names:
+            parts.append(f"Features: {', '.join(names)}")
+
+    if not parts:
+        return ""
+    return "\n\n--- Additional Details ---\n" + "\n".join(parts)
+
+
 def _normalize(item: dict, city: str) -> Optional[Dict[str, Any]]:
     try:
         url = item.get("url", "")
@@ -620,22 +724,42 @@ def _normalize(item: dict, city: str) -> Optional[Dict[str, Any]]:
                 size_m2 = _sqft_to_m2(floor["value"])
             elif unit in ("MTK", "M2", "SQM"):
                 size_m2 = round(float(floor["value"]), 1)
+
+        lat = float(geo["latitude"])  if geo.get("latitude")  else None
+        lng = float(geo["longitude"]) if geo.get("longitude") else None
+        postcode, street = _reverse_geocode(lat, lng) if lat and lng else (None, None)
+
+        # Agent — populate proper columns from schema
+        seller = offers.get("seller") or {}
+        if isinstance(seller, list):
+            seller = seller[0] if seller else {}
+        agent_name  = seller.get("name") or seller.get("tradeName") or None
+        agent_phone = seller.get("telephone") or None
+
+        # Base description + extra fields appended as structured suffix
+        base_desc  = _clean_text(item.get("description")) or ""
+        suffix     = _extra_suffix(item, related, offers)
+        description = (base_desc + suffix).strip() or None
+
         return {
             "source":        "zoopla",
             "listing_url":   url,
             "city":          city,
             "address":       related.get("address") or item.get("name"),
+            "postcode":      postcode,
+            "street":        street,
             "price":         _to_int(offers.get("price")),
             "bedrooms":      related.get("numberOfBedrooms"),
             "bathrooms":     related.get("numberOfBathroomsTotal"),
             "size_m2":       size_m2,
             "property_type": _prop_type(related.get("@type", ""), item.get("name", "")),
-            "description":   _clean_text(item.get("description")),
-            "agent_name":    None,
-            "agent_phone":   None,
+            "tenure":        _tenure(item),
+            "description":   description,
+            "agent_name":    agent_name,
+            "agent_phone":   agent_phone,
             "image_url":     item.get("image"),
-            "lat":           float(geo["latitude"])  if geo.get("latitude")  else None,
-            "lng":           float(geo["longitude"]) if geo.get("longitude") else None,
+            "lat":           lat,
+            "lng":           lng,
         }
     except Exception:
         logger.warning("[zoopla] normalise failed", exc_info=True)

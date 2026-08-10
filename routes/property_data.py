@@ -445,10 +445,11 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
         return {"found": False, "error": str(e)}
 
 
-def _fetch_epc_detail(cert_number: str) -> dict:
+def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
     """
     Scrape the GOV.UK EPC certificate page for fields stripped from the 2025 API:
     floor area, habitable rooms, property type, built form, heating, current/potential scores.
+    Falls back to raw_rec fields (totalFloorArea etc.) when scraping misses them.
     """
     if not _BS4_OK:
         return {"found": False, "error": "bs4 not installed"}
@@ -561,6 +562,26 @@ def _fetch_epc_detail(cert_number: str) -> dict:
         if len(found_scores) >= 2:
             detail["potential_score"] = found_scores[1][0]
             detail["potential_band"]  = found_scores[1][1]
+
+        # Fallback: fill missing fields from the raw EPC API record when scraping missed them
+        if raw_rec and not detail.get("floor_area_m2"):
+            raw_area = raw_rec.get("totalFloorArea") or raw_rec.get("total-floor-area")
+            if raw_area:
+                try:
+                    fa = float(str(raw_area).replace(",", "").strip())
+                    if fa > 0:
+                        detail["floor_area_m2"] = fa
+                        detail.setdefault("floor_area_raw", f"{fa} m²")
+                        print(f"  [epc_detail] floor_area from API record: {fa}")
+                except (ValueError, TypeError):
+                    pass
+        if raw_rec and not detail.get("habitable_rooms"):
+            raw_rooms = raw_rec.get("numberHabitableRooms") or raw_rec.get("number-habitable-rooms")
+            if raw_rooms:
+                try:
+                    detail["habitable_rooms"] = int(str(raw_rooms).strip())
+                except (ValueError, TypeError):
+                    pass
 
         return detail
     except Exception as e:
@@ -810,7 +831,7 @@ def _fetch_crime(lat: float, lng: float) -> dict:
                 r2 = requests.get(
                     "https://data.police.uk/api/crimes-street/all-crime",
                     params={"lat": lat, "lng": lng, "date": prior_month},
-                    timeout=TIMEOUT,
+                    timeout=4,
                 )
                 if r2.ok:
                     crimes2 = r2.json() or []
@@ -1003,9 +1024,11 @@ def get_property_data():
             epc_result = _fetch_epc(postcode, address_hint)
 
         cert_num = None
+        epc_raw_rec = None
         if epc_result.get("found") and epc_result.get("records"):
-            cert_num = epc_result["records"][0].get("certificateNumber")
-        f_epc_detail = pool.submit(_fetch_epc_detail, cert_num) if cert_num else None
+            epc_raw_rec = epc_result["records"][0]
+            cert_num = epc_raw_rec.get("certificateNumber") or epc_raw_rec.get("lmkKey")
+        f_epc_detail = pool.submit(_fetch_epc_detail, cert_num, epc_raw_rec) if cert_num else None
 
         if f_epc_detail:
             epc_result["detail"] = safe(f_epc_detail, "epc_detail", timeout=15)
@@ -1241,10 +1264,9 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
         print(f"  [street] EPC fetched for {len(epc_by_postcode)} postcodes")
 
     # ── Step 4: Match each sale to its best EPC cert number ──────────────
-    # The 2025 MHCLG EPC API returns no floor area fields; we must scrape
-    # the GOV.UK certificate page (_fetch_epc_detail) for each matched cert.
     cert_for_sale: list = [None] * len(sales)
-    epc_addr_for_sale: list = [""] * len(sales)   # matched EPC address for tooltip
+    epc_addr_for_sale: list = [""] * len(sales)
+    raw_rec_for_cert: dict = {}   # cert → raw EPC API record (fallback for floor area)
     for idx, sale in enumerate(sales):
         pc = sale.get("postcode", "")
         records = epc_by_postcode.get(pc, [])
@@ -1260,6 +1282,7 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
                 best_rec_obj = rec
         if best_cert and best_score > 0:
             cert_for_sale[idx] = best_cert
+            raw_rec_for_cert[best_cert] = best_rec_obj
             # Build readable EPC address for the hover tooltip
             epc_addr_for_sale[idx] = ", ".join(
                 v for k in ("addressLine1", "addressLine2", "addressLine3", "postcode")
@@ -1271,7 +1294,7 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
     cert_detail: dict = {}
     if unique_certs:
         def _get_detail(cert):
-            return cert, _fetch_epc_detail(cert)
+            return cert, _fetch_epc_detail(cert, raw_rec_for_cert.get(cert))
         with ThreadPoolExecutor(max_workers=min(5, len(unique_certs))) as pool:
             for cert, detail in pool.map(_get_detail, unique_certs):
                 cert_detail[cert] = detail
@@ -1339,21 +1362,57 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
     }
 
 
+def _street_from_postcode(postcode: str) -> tuple:
+    """
+    Derive (street, town, district) by fetching a small LR sample for the postcode
+    and picking the dominant street/town from the structured address fields.
+    Falls back to ("", "", district) when the LR query returns nothing.
+    """
+    from collections import Counter
+    pc_clean = re.sub(r"\s+", "", (postcode or "").upper())
+    district_m = re.match(r"^([A-Z]{1,2}\d{1,2}[A-Z]?)", pc_clean)
+    district = district_m.group(1) if district_m else ""
+    try:
+        r = requests.get(
+            "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
+            params={"propertyAddress.postcode": postcode, "_pageSize": 20, "_page": 0},
+            timeout=8,
+        )
+        items = r.json().get("result", {}).get("items", [])
+    except Exception:
+        return "", "", district
+
+    sc, tc = Counter(), Counter()
+    for item in items:
+        addr = item.get("propertyAddress", {})
+        if addr.get("street"):
+            sc[addr["street"].upper()] += 1
+        if addr.get("town"):
+            tc[addr["town"].upper()] += 1
+
+    street = sc.most_common(1)[0][0] if sc else ""
+    town   = tc.most_common(1)[0][0] if tc else ""
+    return street, town, district
+
+
 @property_data_bp.route("/api/street-sales")
 def get_street_sales():
     """
     GET /api/street-sales?address=<full_address>&postcode=<postcode>
-    The backend parses the street name + town from the address string.
+    Accepts address+postcode (existing flow) or postcode alone (Zoopla / no-address flow).
     """
     address  = request.args.get("address",  "").strip()
     postcode = request.args.get("postcode", "").strip()
 
-    if not address:
-        return jsonify({"error": "address param required"}), 400
+    if address:
+        street, town, district = _parse_street_and_district(address, postcode)
+    elif postcode:
+        street, town, district = _street_from_postcode(postcode)
+    else:
+        return jsonify({"error": "address or postcode param required"}), 400
 
-    street, town, district = _parse_street_and_district(address, postcode)
     if not street:
-        return jsonify({"error": "Could not parse street name from address"}), 400
+        return jsonify({"found": False, "error": "Could not determine street from postcode"}), 200
 
     result = _fetch_street_sales(street, town, district)
     return jsonify(result)

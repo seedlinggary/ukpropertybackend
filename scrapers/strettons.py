@@ -53,8 +53,33 @@ OnListingFn = Callable[[Dict[str, Any]], Optional[str]]
 
 # Strettons lot pages: /auction-residential-property-for-sale/... or /auction-commercial-property-for-sale/...
 _LOT_HREF_RE = re.compile(
-    r'href="(/auction-(?:residential|commercial)-property-for-sale/[^"]+/)"'
+    r'href="(/auction-(?:(?:residential|commercial)-)?property-for-sale/[^"]+/)"'
 )
+
+SITEMAP_URL = f"{BASE}/properties/details.xml"
+_SITEMAP_LOT_RE = re.compile(
+    r"<loc>(https://www\.strettons\.co\.uk"
+    r"/auction-(?:(?:residential|commercial)-)?property-for-sale/[^<]+/)</loc>"
+)
+
+
+def _lot_urls_from_sitemap() -> List[str]:
+    """Extract auction lot URLs from the sitemap XML.
+
+    The sitemap is server-rendered XML — no JS rendering needed.
+    Used as a fallback when catalogue pages yield zero lot links.
+    """
+    try:
+        html = direct_curl(SITEMAP_URL, SOURCE)
+        if not html:
+            logger.warning("[%s] sitemap returned nothing", SOURCE)
+            return []
+        urls = _SITEMAP_LOT_RE.findall(html)
+        logger.info("[%s] sitemap: %d auction lot URLs", SOURCE, len(urls))
+        return urls
+    except Exception:
+        logger.warning("[%s] sitemap fetch failed", SOURCE, exc_info=True)
+        return []
 
 
 def _is_content_rich(html: str) -> bool:
@@ -323,8 +348,8 @@ def _parse_card_from_page(html: str, lot_url: str) -> Optional[Dict[str, Any]]:
                     break
 
         if _is_sold_lot(card):
-            logger.debug("[%s] Skipping sold lot: %s", SOURCE, lot_url)
-            return None
+            logger.debug("[%s] Sold lot (card): %s", SOURCE, lot_url)
+            return {"_sold": True}
 
         return {
             "address":      address,
@@ -336,7 +361,7 @@ def _parse_card_from_page(html: str, lot_url: str) -> Optional[Dict[str, Any]]:
         }
     except Exception:
         logger.debug("[%s] card parse error for %s", SOURCE, lot_url, exc_info=True)
-        return None
+        return None  # parse failure — caller should still attempt detail page
 
 
 # ── Detail page parser ────────────────────────────────────────────────────────
@@ -482,6 +507,7 @@ class StrrettonsScraper(BaseScraper):
         results: List[Dict[str, Any]] = []
         stop_all = False
         seen_urls: set = set()
+        found_lot_urls: set = set()  # tracks all lot URLs seen from catalogues
 
         # Strettons is a React app — browser tier required for JS rendering.
         uc_driver = None
@@ -513,6 +539,7 @@ class StrrettonsScraper(BaseScraper):
                 # Deduplicate across catalogue pages
                 lot_urls = [u for u in lot_urls if u not in seen_urls]
                 seen_urls.update(lot_urls)
+                found_lot_urls.update(lot_urls)
 
                 logger.info(
                     "[%s] %s: %d lots, auction_date=%s",
@@ -525,16 +552,12 @@ class StrrettonsScraper(BaseScraper):
 
                     card = _parse_card_from_page(html, lot_url)
 
-                    # _parse_card_from_page returns None for sold lots (or parse failures).
-                    # Skip entirely — we only want available lots.
-                    if card is None:
+                    # _sold=True → confirmed sold on the catalogue card; skip cheaply.
+                    # None → CSS parse failure; still attempt the detail page.
+                    if card is not None and card.get("_sold"):
                         continue
 
-                    # The <address class="lot_number"> element contains the lot's
-                    # actual auction date (e.g. "04 Jun 26 - Lot 5"). This is the
-                    # most specific and authoritative source — preserve it even if
-                    # the date is in the past (lot may have just been auctioned).
-                    card_date = card.get("auction_date")
+                    card_date = card.get("auction_date") if card else None
 
                     partial = {
                         "source":        SOURCE,
@@ -580,6 +603,74 @@ class StrrettonsScraper(BaseScraper):
                                     # by text-searching the detail page. Preserve it.
                                     if k == "auction_date" and card_date is not None:
                                         continue
+                                    partial[k] = v
+                            if partial.get("city") is None and partial.get("address"):
+                                partial["city"] = city_from_address(partial["address"])
+
+                    results.append(partial)
+
+            # ── Sitemap fallback ────────────────────────────────────────────────
+            # When catalogue pages return zero lot links (JS rendering unavailable
+            # or Strettons changed their React component structure), fall back to
+            # the sitemap XML which lists all lot URLs as plain server-rendered XML.
+            if not found_lot_urls and not stop_all:
+                logger.info(
+                    "[%s] No lot URLs from catalogue pages — trying sitemap fallback",
+                    SOURCE,
+                )
+                sitemap_urls = _lot_urls_from_sitemap()
+                new_urls = [u for u in sitemap_urls if u not in seen_urls]
+                seen_urls.update(new_urls)
+                logger.info(
+                    "[%s] sitemap: %d new lot URLs to process", SOURCE, len(new_urls)
+                )
+
+                for lot_url in new_urls:
+                    if stop_all:
+                        break
+
+                    partial = {
+                        "source":        SOURCE,
+                        "listing_url":   lot_url,
+                        "city":          None,
+                        "address":       None,
+                        "price":         None,
+                        "bedrooms":      None,
+                        "bathrooms":     None,
+                        "size_m2":       None,
+                        "property_type": None,
+                        "description":   None,
+                        "agent_name":    "Strettons",
+                        "agent_phone":   None,
+                        "image_url":     None,
+                        "lat":           None,
+                        "lng":           None,
+                        "auction_date":  None,
+                        "lot_number":    None,
+                    }
+
+                    if on_listing is not None:
+                        action = on_listing(partial)
+                        if action == "stop":
+                            logger.info("[%s] on_listing=stop (sitemap)", SOURCE)
+                            stop_all = True
+                            break
+                        if action == "skip":
+                            continue
+
+                    if fetch_details:
+                        time.sleep(random.uniform(0.5, 1.2))
+                        detail_html = _get_html(lot_url, self._tracker, "detail", uc_driver)
+                        if detail_html:
+                            if _is_sold_detail_html(detail_html):
+                                logger.debug(
+                                    "[%s] Skipping sold lot (sitemap/detail): %s",
+                                    SOURCE, lot_url,
+                                )
+                                continue
+                            detail = _parse_detail_page(detail_html, None)
+                            for k, v in detail.items():
+                                if v is not None:
                                     partial[k] = v
                             if partial.get("city") is None and partial.get("address"):
                                 partial["city"] = city_from_address(partial["address"])
