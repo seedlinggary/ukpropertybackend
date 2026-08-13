@@ -56,12 +56,12 @@ def _scheduled_hmlr_refresh() -> None:
     """Monthly: download latest CCOD/OCOD from HMLR then import into DB."""
     import os
     logger.info("[scheduler] Triggered monthly HMLR CCOD/OCOD refresh")
-    if not os.getenv("HMLR_EMAIL") or not os.getenv("HMLR_PASSWORD"):
-        logger.warning("[scheduler] HMLR_EMAIL / HMLR_PASSWORD not set — skipping CCOD refresh")
+    if not os.getenv("HMLR_API_KEY"):
+        logger.warning("[scheduler] HMLR_API_KEY not set — skipping CCOD refresh")
         return
     try:
-        from scripts.download_hmlr import download_datasets
-        download_datasets(import_after=True)
+        from scripts.download_hmlr import run
+        run(import_after=True)
         logger.info("[scheduler] HMLR refresh complete")
     except Exception:
         logger.exception("[scheduler] HMLR refresh failed")

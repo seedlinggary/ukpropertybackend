@@ -14,6 +14,7 @@ import time
 import functools
 import urllib.request
 import urllib.error
+import urllib.parse
 import base64
 import json as _json
 from flask import Blueprint, jsonify, request
@@ -131,7 +132,7 @@ def search_ownership():
             if mode == "reg":
                 rows = conn.execute(text("""
                     SELECT company_name, company_number, proprietor_cat, country,
-                           COUNT(*) AS title_count
+                           COUNT(*) AS title_count, MIN(source) AS source
                     FROM company_ownership
                     WHERE company_number = :q
                     GROUP BY company_name, company_number, proprietor_cat, country
@@ -160,18 +161,23 @@ def search_ownership():
 
                 rows = conn.execute(text(f"""
                     WITH top_names AS (
-                        SELECT company_name
+                        SELECT company_name, title_count
                         FROM {name_table}
                         WHERE company_name ILIKE :pat
                         ORDER BY title_count DESC
                         LIMIT :lim OFFSET :off
                     )
-                    SELECT s.company_name, s.company_number, s.proprietor_cat, s.country,
-                           SUM(s.title_count) AS title_count
+                    SELECT
+                        s.company_name,
+                        MAX(s.company_number)   AS company_number,
+                        MIN(s.proprietor_cat)   AS proprietor_cat,
+                        MIN(s.country)          AS country,
+                        n.title_count,
+                        MIN(s.source)           AS source
                     FROM company_ownership_summary s
-                    JOIN top_names t ON s.company_name = t.company_name
-                    GROUP BY s.company_name, s.company_number, s.proprietor_cat, s.country
-                    ORDER BY title_count DESC, s.company_name
+                    JOIN top_names n ON s.company_name = n.company_name
+                    GROUP BY s.company_name, n.title_count
+                    ORDER BY n.title_count DESC, s.company_name
                 """), {"pat": f"%{q}%", "lim": limit, "off": offset}).fetchall()
 
                 total_row = conn.execute(text(f"""
@@ -180,11 +186,12 @@ def search_ownership():
 
         companies = [
             {
-                "company_name":  r[0],
+                "company_name":   r[0],
                 "company_number": r[1],
                 "proprietor_cat": r[2],
                 "country":        r[3],
                 "title_count":    r[4],
+                "source":         r[5],
             }
             for r in rows
         ]
@@ -218,7 +225,28 @@ def get_titles():
     try:
         with engine.connect() as conn:
             conn.execute(text("SET statement_timeout = 0"))
-            if reg:
+            if reg and name:
+                # Use name ILIKE as the sole filter — HMLR company numbers are
+                # unreliable (missing leading zeros, reused across unrelated companies)
+                # so adding OR company_number = :reg contaminates results with
+                # unrelated companies that happen to share the same HMLR number.
+                # name ILIKE already catches all records for the company regardless
+                # of whether individual rows have a company_number or not.
+                rows = conn.execute(text("""
+                    SELECT title_number, tenure, address, postcode, district,
+                           county, region, source, company_name,
+                           date_added::text
+                    FROM company_ownership
+                    WHERE company_name ILIKE :name
+                    ORDER BY address NULLS LAST
+                    LIMIT :lim OFFSET :off
+                """), {"name": name, "lim": limit, "off": offset}).fetchall()
+
+                total_row = conn.execute(text("""
+                    SELECT COUNT(*) FROM company_ownership
+                    WHERE company_name ILIKE :name
+                """), {"name": name}).fetchone()
+            elif reg:
                 rows = conn.execute(text("""
                     SELECT title_number, tenure, address, postcode, district,
                            county, region, source, company_name,
@@ -230,8 +258,7 @@ def get_titles():
                 """), {"reg": reg, "lim": limit, "off": offset}).fetchall()
 
                 total_row = conn.execute(text("""
-                    SELECT COUNT(*) FROM company_ownership
-                    WHERE company_number = :reg
+                    SELECT COUNT(*) FROM company_ownership WHERE company_number = :reg
                 """), {"reg": reg}).fetchone()
             else:
                 # Exact name match for the titles view
@@ -453,36 +480,125 @@ def ownership_by_address():
         return jsonify({"matches": [], "error": str(exc)})
 
 
+def _ch_get(url: str, creds: str, timeout: int = 10) -> dict:
+    """Authenticated GET to the Companies House API; raises HTTPError on non-200."""
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Basic {creds}")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return _json.loads(r.read())
+
+
+def _ch_resolve_name(name: str, creds: str) -> str | None:
+    """
+    Search CH by company name and return the company_number on an exact
+    case-insensitive name match, or None.
+
+    Only returns on exact match — no first-result fallback.  HMLR names are
+    reliable; CH numbers are not.  Using the first non-exact result risks
+    resolving to a completely different company with a similar name.
+    """
+    qs = urllib.parse.urlencode({"q": name, "items_per_page": "5"})
+    try:
+        data = _ch_get(
+            f"https://api.company-information.service.gov.uk/search/companies?{qs}",
+            creds, timeout=8,
+        )
+    except Exception:
+        return None
+    name_upper = name.upper().strip()
+    for item in data.get("items", []):
+        if item.get("title", "").upper().strip() == name_upper:
+            return item.get("company_number")
+    return None
+
+
 @ownership_bp.route("/api/ownership/companies-house/<company_number>")
 def companies_house_lookup(company_number: str):
-    """Proxy to Companies House free API — requires COMPANIES_HOUSE_API_KEY in .env."""
+    """Proxy to Companies House free API — requires COMPANIES_HOUSE_API_KEY in .env.
+    Accepts optional ?name= param; used as fallback when the HMLR number returns 404
+    (HMLR frequently omits leading zeros or stores incorrect registration numbers).
+    """
     api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
     if not api_key:
         return jsonify({"error": "COMPANIES_HOUSE_API_KEY not set", "error_type": "no_api_key"}), 200
 
-    # Sanitise: CH numbers are 8 chars alphanumeric (letters + digits)
     clean = re.sub(r"[^A-Z0-9]", "", company_number.upper())
     if not clean or len(clean) > 10:
         return jsonify({"error": "Invalid company number"}), 400
 
+    name  = request.args.get("name", "").strip()
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+
+    # Name is the reliable identifier; HMLR numbers are not.
+    # When a name is supplied, resolve via CH name search first so we always
+    # fetch the correct company — even when the HMLR number belongs to an
+    # entirely different company on CH (a known data quality issue in HMLR).
+    if name:
+        resolved = _ch_resolve_name(name, creds)
+        lookup_num = resolved if resolved else clean
+    else:
+        lookup_num = clean
+
+    def _fetch(num):
+        return _ch_get(
+            f"https://api.company-information.service.gov.uk/company/{num}",
+            creds,
+        )
+
     try:
-        url = f"https://api.company-information.service.gov.uk/company/{clean}"
-        req = urllib.request.Request(url)
-        creds = base64.b64encode(f"{api_key}:".encode()).decode()
-        req.add_header("Authorization", f"Basic {creds}")
-        req.add_header("Accept", "application/json")
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = _json.loads(r.read())
-        return jsonify(data)
+        return jsonify(_fetch(lookup_num))
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return jsonify({"error": "Company not found", "error_type": "not_found"}), 200
         if e.code == 401:
             return jsonify({"error": "Invalid API key", "error_type": "auth_error"}), 200
+        if e.code == 404:
+            return jsonify({"error": "Company not found", "error_type": "not_found"}), 200
         return jsonify({"error": f"Companies House returned {e.code}", "error_type": "api_error"}), 200
     except Exception as exc:
         logger.exception("[ownership] companies-house lookup error")
         return jsonify({"error": str(exc), "error_type": "server_error"}), 200
+
+
+@ownership_bp.route("/api/ownership/companies-house/<company_number>/charges")
+def companies_house_charges(company_number: str):
+    """Proxy to Companies House charges API — requires COMPANIES_HOUSE_API_KEY in .env.
+    Same name-fallback logic as companies_house_lookup.
+    """
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": "COMPANIES_HOUSE_API_KEY not set", "error_type": "no_api_key", "items": []}), 200
+
+    clean = re.sub(r"[^A-Z0-9]", "", company_number.upper())
+    if not clean or len(clean) > 10:
+        return jsonify({"error": "Invalid company number", "items": []}), 400
+
+    name  = request.args.get("name", "").strip()
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+
+    # Same name-first resolution as the company profile endpoint.
+    if name:
+        resolved = _ch_resolve_name(name, creds)
+        lookup_num = resolved if resolved else clean
+    else:
+        lookup_num = clean
+
+    def _fetch(num):
+        return _ch_get(
+            f"https://api.company-information.service.gov.uk/company/{num}/charges",
+            creds,
+        )
+
+    try:
+        return jsonify(_fetch(lookup_num))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return jsonify({"error": "Invalid API key", "error_type": "auth_error", "items": []}), 200
+        if e.code == 404:
+            return jsonify({"items": [], "total_count": 0}), 200
+        return jsonify({"error": f"Companies House returned {e.code}", "error_type": "api_error", "items": []}), 200
+    except Exception as exc:
+        logger.exception("[ownership] companies-house charges error")
+        return jsonify({"error": str(exc), "error_type": "server_error", "items": []}), 200
 
 
 @ownership_bp.route("/api/ownership/stats")
