@@ -135,7 +135,6 @@ def _postcode_from_latlng(lat: float, lng: float):
             params={"lon": lng, "lat": lat, "limit": 1},
             timeout=5,
         )
-        print(f"  [postcodes.io] status={r.status_code}")
         if r.ok:
             results = (r.json() or {}).get("result") or []
             if results:
@@ -151,8 +150,8 @@ def _postcode_from_latlng(lat: float, lng: float):
                     "lsoa":        codes.get("lsoa"),
                     "national_park": res.get("nuts") if res.get("nuts") and "park" in str(res.get("nuts", "")).lower() else None,
                 }
-    except Exception as e:
-        print(f"  [postcodes.io] EXCEPTION: {e}")
+    except Exception:
+        pass
     return None
 
 
@@ -350,8 +349,8 @@ def _epc_match_score(known_address: str, record: dict,
     return min(score, 100) if score else 0
 
 
-def _fetch_epc(postcode: str, address: str = "") -> dict:
-    print(f"  [epc] fetching postcode={postcode!r}  address={address!r}")
+def _fetch_epc(postcode: str, address: str = "", *,
+               paon: str | None = None, saon: str | None = None) -> dict:
     if not EPC_BEARER:
         return {"found": False, "error": "EPC_BEARER_TOKEN not configured in .env"}
 
@@ -361,62 +360,50 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
     def _api_get(params: dict) -> list:
         try:
             r = requests.get(api_url, params=params, headers=headers, timeout=TIMEOUT)
-            print(f"  [epc] GET {params} status={r.status_code}")
             if r.ok:
                 data = (r.json() or {}).get("data", [])
                 # API returns {"data": {"error": "..."}} (a dict, not a list) when no
                 # certificates match.  Guard here so callers always receive a list.
                 return data if isinstance(data, list) else []
-            print(f"  [epc] error body={r.text[:200]!r}")
-        except Exception as exc:
-            print(f"  [epc] request error: {exc}")
+        except Exception:
+            pass
         return []
 
+    def _score(rec: dict) -> int:
+        return _epc_match_score(address, rec, paon=paon, saon=saon)
+
     def _best(records: list) -> tuple:
-        """Return (best_score, sorted_records).
-        Primary sort: address match score DESC.
-        Tiebreaker: registration date DESC — so the most recent cert wins when
-        a property has both an old cert (e.g. D) and a newer cert (e.g. E).
-        """
-        if not records or not address:
+        """Return (best_score, sorted_records)."""
+        if not records or (not address and paon is None):
             return 0, records
-        srt = sorted(
-            records,
-            key=lambda rec: (
-                _epc_match_score(address, rec),
-                rec.get("registrationDate") or rec.get("inspection-date") or "",
-            ),
-            reverse=True,
-        )
-        return _epc_match_score(address, srt[0]), srt
+        srt = sorted(records, key=_score, reverse=True)
+        return _score(srt[0]), srt
 
     try:
         # ── Stage 1: targeted address+postcode search ─────────────────────────
-        # The EPC API's 'address' param does a free-text search within the postcode.
-        # This is precise and unaffected by postcode size — it doesn't rely on a
-        # fixed page window, so a postcode with 200 records is not a problem.
-        if address:
-            street_part = address.split(",")[0].strip()  # "2 Bisley Place, Hounslow…" → "2 Bisley Place"
-            targeted = _api_get({"postcode": postcode, "address": street_part, "size": 5})
+        # Use paon (building number) when available — more reliable than splitting
+        # the joined address string, which may start with a flat/unit label.
+        if address or paon:
+            if paon:
+                street_part = paon.strip()
+            else:
+                # Fallback: first comma-segment (works for "2 Bisley Place, …" but
+                # not for flat addresses — paon path avoids this)
+                street_part = address.split(",")[0].strip()
+            targeted = _api_get({"postcode": postcode, "address": street_part, "size": 10})
             if targeted:
                 score, scored = _best(targeted)
-                top = scored[0]
-                print(f"  [epc] targeted: score={score}  addr={top.get('addressLine1')!r}"
-                      f"  cert={top.get('certificateNumber') or top.get('lmkKey')!r}"
-                      f"  rating={top.get('currentEnergyRating')!r}"
-                      f"  date={top.get('registrationDate')!r}")
                 if score > 0:
-                    matched = [r for r in scored if _epc_match_score(address, r) > 0]
+                    matched = [r for r in scored if _score(r) > 0]
                     return {"found": True, "records": matched}
-            print(f"  [epc] targeted gave no match — falling back to paginated postcode search")
 
         # ── Stage 2: paginated postcode search ───────────────────────────────
-        # Fetches up to 100 records (4 pages of 25), stopping early once a match
-        # is confirmed. Deduplication by lmkKey handles APIs that ignore 'from'.
+        # Fetches up to 100 records (4 pages × 25).  Dense postcodes (E2 8DP
+        # has 60+ properties) need more pages so we don't cut off early.
         all_records: list = []
         seen_keys: set = set()
 
-        for offset in range(0, 50, 25):  # 2 pages × 25 = 50 records (enough for most postcodes)
+        for offset in range(0, 100, 25):  # 4 pages × 25 = 100 records max
             page = _api_get({"postcode": postcode, "size": 25, "from": offset})
             new_count = 0
             for rec in page:
@@ -426,41 +413,31 @@ def _fetch_epc(postcode: str, address: str = "") -> dict:
                     all_records.append(rec)
                     new_count += 1
 
-            print(f"  [epc] page from={offset}: {new_count} new (total unique={len(all_records)})")
-
             if len(page) < 25 or new_count == 0:
                 break  # Last page, or API doesn't support 'from' (returning duplicates)
 
-            if address:
+            if address or paon is not None:
                 score, _ = _best(all_records)
                 if score > 0:
-                    print(f"  [epc] good match found at offset {offset} — stopping pagination")
                     break
 
-        print(f"  [epc] postcode search done: {len(all_records)} unique records")
         if not all_records:
             return {"found": False, "reason": "no_records",
                     "error": f"No EPC records found for postcode {postcode}"}
 
-        if address:
+        if address or paon is not None:
             score, scored = _best(all_records)
-            top = scored[0]
-            print(f"  [epc] final: score={score}  addr={top.get('addressLine1')!r}"
-                  f"  cert={top.get('certificateNumber') or top.get('lmkKey')!r}"
-                  f"  currentEnergyRating={top.get('currentEnergyRating')!r}"
-                  f"  date={top.get('registrationDate')!r}")
             if score == 0:
                 return {"found": False, "reason": "no_match",
                         "error": f"No EPC match in {postcode} ({len(all_records)} records searched — "
                                  f"property may use a neighbouring postcode)"}
             # Only return records from the same building (filter out score-0 neighbours)
-            matched = [r for r in scored if _epc_match_score(address, r) > 0]
+            matched = [r for r in scored if _score(r) > 0]
             return {"found": True, "records": matched, "postcode_searched": postcode}
 
         return {"found": True, "records": all_records, "postcode_searched": postcode}
 
     except Exception as e:
-        print(f"  [epc] EXCEPTION: {e}")
         return {"found": False, "error": str(e)}
 
 
@@ -478,7 +455,6 @@ def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         })
-        print(f"  [epc_detail] status={r.status_code}  cert={cert_number[:14]}")
         if not r.ok:
             return {"found": False}
 
@@ -563,9 +539,7 @@ def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
                         detail["hot_water"] = description
             break  # only need the first features table
 
-        # EPC numeric scores — SVG text elements are rendered as "55 E" (current), "73 D" (potential).
-        # The SVG renders the potential indicator first in document order, so we cannot rely on
-        # position. Instead: collect both scores and sort — current is always <= potential.
+        # EPC numeric scores — SVG text elements are rendered as "55 D" (current), "73 C" (potential)
         score_re = re.compile(r"^(\d{1,3})\s+([A-G])\+?$")
         found_scores: list = []
         for svg in soup.find_all("svg"):
@@ -577,38 +551,12 @@ def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
                     if pair not in found_scores:
                         found_scores.append(pair)
 
-        if len(found_scores) >= 2:
-            # Sort ascending by numeric score: lower score = current, higher = potential
-            s = sorted(found_scores, key=lambda x: x[0])
-            detail["current_score"]   = s[0][0]
-            detail["current_band"]    = s[0][1]
-            detail["potential_score"] = s[1][0]
-            detail["potential_band"]  = s[1][1]
-        elif len(found_scores) == 1:
+        if len(found_scores) >= 1:
             detail["current_score"] = found_scores[0][0]
             detail["current_band"]  = found_scores[0][1]
-
-        # API record is authoritative — override scraped SVG with API values when available.
-        # The main property-data endpoint always passes raw_rec; /api/epc-detail does not.
-        if raw_rec:
-            api_band  = raw_rec.get("currentEnergyRating")  or raw_rec.get("current-energy-rating")
-            api_score = raw_rec.get("currentEnergyEfficiency") or raw_rec.get("current-energy-efficiency")
-            api_pband = raw_rec.get("potentialEnergyRating") or raw_rec.get("potential-energy-rating")
-            api_pscore = raw_rec.get("potentialEnergyEfficiency") or raw_rec.get("potential-energy-efficiency")
-            if api_band:
-                detail["current_band"] = str(api_band).upper()
-            if api_score is not None:
-                try:
-                    detail["current_score"] = int(str(api_score).strip())
-                except (ValueError, TypeError):
-                    pass
-            if api_pband:
-                detail["potential_band"] = str(api_pband).upper()
-            if api_pscore is not None:
-                try:
-                    detail["potential_score"] = int(str(api_pscore).strip())
-                except (ValueError, TypeError):
-                    pass
+        if len(found_scores) >= 2:
+            detail["potential_score"] = found_scores[1][0]
+            detail["potential_band"]  = found_scores[1][1]
 
         # Fallback: fill missing fields from the raw EPC API record when scraping missed them
         if raw_rec and not detail.get("floor_area_m2"):
@@ -619,7 +567,6 @@ def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
                     if fa > 0:
                         detail["floor_area_m2"] = fa
                         detail.setdefault("floor_area_raw", f"{fa} m²")
-                        print(f"  [epc_detail] floor_area from API record: {fa}")
                 except (ValueError, TypeError):
                     pass
         if raw_rec and not detail.get("habitable_rooms"):
@@ -632,7 +579,6 @@ def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
 
         return detail
     except Exception as e:
-        print(f"  [epc_detail] EXCEPTION: {e}")
         return {"found": False, "error": str(e)}
 
 
@@ -650,7 +596,6 @@ def _fetch_council_tax(postcode: str) -> dict:
 
         # Step 1: GET search page to collect session cookies / CSRF token
         r0 = session.get(f"{base}/search", timeout=8, headers=headers)
-        print(f"  [ctax] GET /search status={r0.status_code}")
         if not r0.ok:
             return {"found": False, "error": f"HTTP {r0.status_code}"}
 
@@ -680,7 +625,6 @@ def _fetch_council_tax(postcode: str) -> dict:
         else:
             r1 = session.post(action, data=form_data, timeout=8,
                               headers=headers, allow_redirects=True)
-        print(f"  [ctax] {method.upper()} results status={r1.status_code}  url={r1.url[:80]}")
         if not r1.ok:
             return {"found": False, "error": f"HTTP {r1.status_code}"}
 
@@ -702,12 +646,10 @@ def _fetch_council_tax(postcode: str) -> dict:
             return {"found": True, "properties": bands}
         return {"found": False}
     except Exception as e:
-        print(f"  [ctax] EXCEPTION: {e}")
         return {"found": False, "error": str(e)}
 
 
 def _fetch_sales(postcode: str) -> dict:
-    print(f"  [sales] fetching postcode={postcode!r}")
     try:
         r = requests.get(
             "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
@@ -719,12 +661,10 @@ def _fetch_sales(postcode: str) -> dict:
             headers={"Accept": "application/json"},
             timeout=TIMEOUT,
         )
-        print(f"  [sales] status={r.status_code}")
         if not r.ok:
             return {"found": False, "error": f"Land Registry API {r.status_code}"}
 
         items = (r.json() or {}).get("result", {}).get("items", [])
-        print(f"  [sales] items found={len(items)}")
         sales = []
         for item in items:
             addr = item.get("propertyAddress") or {}
@@ -780,20 +720,6 @@ def _fetch_planning(lat: float, lng: float) -> dict:
         "registered_park_garden":"park-and-garden",
     }
 
-    def _bbox_wkt(buffer_m: float = 120) -> str:
-        """Return a WKT POLYGON bounding box around (lat, lng) for use as a geometry fallback."""
-        dlat = buffer_m / 111_000
-        dlng = buffer_m / (111_000 * abs(__import__("math").cos(__import__("math").radians(lat))))
-        return (
-            f"POLYGON(("
-            f"{lng-dlng} {lat-dlat},"
-            f"{lng+dlng} {lat-dlat},"
-            f"{lng+dlng} {lat+dlat},"
-            f"{lng-dlng} {lat+dlat},"
-            f"{lng-dlng} {lat-dlat}"
-            f"))"
-        )
-
     def _one(item):
         key, dataset = item
         try:
@@ -803,34 +729,13 @@ def _fetch_planning(lat: float, lng: float) -> dict:
                 headers={"Accept": "application/json"},
                 timeout=TIMEOUT,
             )
-            print(f"  [planning/{key}] status={r.status_code}")
             if r.ok:
                 entities = (r.json() or {}).get("entities", [])
-                # Listed buildings use exact polygon boundaries — a clicked point may
-                # not fall inside the registered polygon. Fall back to a 120m bounding
-                # box intersection if the point query returns nothing.
-                if not entities and key == "listed_building":
-                    rb = requests.get(
-                        "https://www.planning.data.gov.uk/entity.json",
-                        params={
-                            "dataset": dataset,
-                            "geometry": _bbox_wkt(120),
-                            "geometry_relation": "intersects",
-                            "limit": 5,
-                        },
-                        headers={"Accept": "application/json"},
-                        timeout=TIMEOUT,
-                    )
-                    if rb.ok:
-                        entities = (rb.json() or {}).get("entities", [])
-                        if entities:
-                            print(f"  [planning/{key}] bbox fallback found {len(entities)}")
                 return key, {
                     "found": bool(entities),
                     "count": len(entities),
                     "names": [e.get("name") or e.get("reference", "") for e in entities],
                 }
-            print(f"  [planning/{key}] body={r.text[:120]!r}")
             return key, {"found": False, "error": f"HTTP {r.status_code}"}
         except Exception as e:
             return key, {"found": False, "error": str(e)}
@@ -847,10 +752,8 @@ def _fetch_flood(lat: float, lng: float) -> dict:
             headers={"Accept": "application/json"},
             timeout=TIMEOUT,
         )
-        print(f"  [flood] status={r.status_code}")
         if r.ok:
             entities = (r.json() or {}).get("entities", [])
-            print(f"  [flood] entities={len(entities)}")
             if entities:
                 max_zone = 1
                 for e in entities:
@@ -862,13 +765,12 @@ def _fetch_flood(lat: float, lng: float) -> dict:
                             pass
                 labels = {1: "Low probability", 2: "Medium probability", 3: "High probability"}
                 return {"zone": max_zone, "label": labels[max_zone]}
-    except Exception as e:
-        print(f"  [flood] EXCEPTION: {e}")
+    except Exception:
+        pass
     return {"zone": 1, "label": "Low probability"}
 
 
 def _fetch_crime(lat: float, lng: float) -> dict:
-    print(f"  [crime] fetching lat={lat}  lng={lng}")
 
     def _parse(crimes: list) -> tuple[int, list]:
         counts: dict = {}
@@ -892,11 +794,9 @@ def _fetch_crime(lat: float, lng: float) -> dict:
             params={"lat": lat, "lng": lng},
             timeout=TIMEOUT,
         )
-        print(f"  [crime] status={r.status_code}")
         if not r.ok:
             return {"found": False, "error": f"Police API {r.status_code}"}
         crimes = r.json() or []
-        print(f"  [crime] total={len(crimes)}")
         month = crimes[0].get("month") if crimes else None
         total, categories = _parse(crimes)
 
@@ -919,9 +819,8 @@ def _fetch_crime(lat: float, lng: float) -> dict:
                     yoy_month = prior_month
                     if yoy_total:
                         yoy_change = round((total - yoy_total) / yoy_total * 100)
-                    print(f"  [crime] yoy={yoy_total} ({prior_month})")
-            except Exception as exc:
-                print(f"  [crime] yoy error: {exc}")
+            except Exception:
+                pass
 
         return {
             "found": bool(crimes),
@@ -934,7 +833,6 @@ def _fetch_crime(lat: float, lng: float) -> dict:
             "yoy_change": yoy_change,
         }
     except Exception as e:
-        print(f"  [crime] EXCEPTION: {e}")
         return {"found": False, "error": str(e)}
 
 
@@ -960,7 +858,6 @@ def _fetch_nearby(lat: float, lng: float) -> dict:
     for endpoint in _OVERPASS_ENDPOINTS:
         try:
             r = requests.get(endpoint, params={"data": query}, timeout=8)
-            print(f"  [nearby] {endpoint.split('/')[2]} status={r.status_code}")
             if r.ok:
                 break
         except Exception:
@@ -970,7 +867,6 @@ def _fetch_nearby(lat: float, lng: float) -> dict:
             return {"found": False, "error": f"Overpass {r.status_code if r else 'no response'}"}
 
         elements = (r.json() or {}).get("elements", [])
-        print(f"  [nearby] elements={len(elements)}")
 
         buckets: dict = {"schools": [], "transport": [], "shops": [], "health": [], "parks": []}
 
@@ -1013,7 +909,6 @@ def _fetch_nearby(lat: float, lng: float) -> dict:
         return {"found": True, **buckets}
 
     except Exception as e:
-        print(f"  [nearby] EXCEPTION: {e}")
         return {"found": False, "error": str(e)}
 
 
@@ -1027,15 +922,12 @@ def get_epc_detail():
 
 @property_data_bp.route("/api/property-data")
 def get_property_data():
-    print("\n=== /api/property-data HIT ===")
     try:
         lat = float(request.args["lat"])
         lng = float(request.args["lng"])
     except (KeyError, ValueError):
-        print("  ERROR: missing lat/lng params")
         return jsonify({"error": "lat and lng query params required"}), 400
 
-    print(f"  lat={lat}  lng={lng}")
 
     # Check in-memory cache.
     # Key = rounded coords + address hint hash so two different properties
@@ -1046,7 +938,6 @@ def get_property_data():
     _now = time.time()
     _cached = _PROP_DATA_CACHE.get(_cache_key)
     if _cached and (_now - _cached[1]) < _PROP_DATA_TTL:
-        print(f"  [cache HIT] {_cache_key}")
         return jsonify(_cached[0])
 
     # Optional address hint — used to rank EPC records so the correct property surfaces first
@@ -1054,7 +945,6 @@ def get_property_data():
 
     loc = _postcode_from_latlng(lat, lng)
     postcode = (loc or {}).get("postcode")
-    print(f"  postcode resolved: {postcode!r}  region={(loc or {}).get('region')!r}  address_hint={address_hint!r}")
 
     # Mapbox geocoded labels include the address-level postcode (e.g. "145 Lampton Road, TW3 4EB").
     # postcodes.io returns the centroid postcode of clicked coordinates which can be a different
@@ -1067,15 +957,13 @@ def get_property_data():
         addr_postcode = addr_postcode[:-3] + " " + addr_postcode[-3:]
     epc_postcode = addr_postcode if addr_postcode else postcode
     if addr_postcode and addr_postcode != postcode:
-        print(f"  address_hint postcode={addr_postcode!r} overrides centroid={postcode!r} for EPC lookup")
+        pass
 
     def safe(future, label, timeout=20):
         try:
             result = future.result(timeout=timeout)
-            print(f"  [{label}] OK — {str(result)[:120]}")
             return result
         except Exception as e:
-            print(f"  [{label}] EXCEPTION: {e}")
             return {"error": str(e)}
 
     no_pc = {"found": False, "error": "Could not determine postcode"}
@@ -1100,7 +988,6 @@ def get_property_data():
         _cent_pc_norm  = (postcode or "").replace(" ", "").upper()
         if (not epc_result.get("found") and
                 _addr_pc_norm and _cent_pc_norm and _addr_pc_norm != _cent_pc_norm):
-            print(f"  [epc] no match with addr_postcode={addr_postcode!r} — trying centroid={postcode!r}")
             epc_result = _fetch_epc(postcode, address_hint)
 
         cert_num = None
@@ -1170,7 +1057,6 @@ def get_property_data():
                 del _PROP_DATA_CACHE[k]
         _PROP_DATA_CACHE[_cache_key] = (result, time.time())
 
-        print(f"  returning response for postcode={postcode!r}")
         return jsonify(result)
 
 
@@ -1219,7 +1105,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
     Fetch all Land Registry sales for a given street name, then batch-match
     EPC records (by postcode) to append floor_area_m2 and price_per_m2.
     """
-    print(f"  [street] fetching street={street!r}  town={town!r}  district={district!r}")
 
     # ── Step 1: Query Land Registry ───────────────────────────────────────
     params: dict = {
@@ -1241,7 +1126,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
                 headers={"Accept": "application/json"},
                 timeout=TIMEOUT,
             )
-            print(f"  [street] LR page={page_num} status={r.status_code}")
             if not r.ok:
                 break
             items = (r.json() or {}).get("result", {}).get("items", [])
@@ -1249,7 +1133,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
             if len(items) < 100:
                 break
         except Exception as exc:
-            print(f"  [street] LR error: {exc}")
             break
 
     if not all_items:
@@ -1267,7 +1150,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
                 )
                 if r.ok:
                     all_items = (r.json() or {}).get("result", {}).get("items", [])
-                    print(f"  [street] fallback (no town): {len(all_items)} items")
             except Exception:
                 pass
 
@@ -1288,7 +1170,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
                 filtered.append(item)
         if filtered:
             all_items = filtered
-            print(f"  [street] after district filter ({district}): {len(all_items)} items")
 
     # ── Step 2: Parse into sale dicts ─────────────────────────────────────
     sales: list = []
@@ -1341,7 +1222,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
         with ThreadPoolExecutor(max_workers=min(8, len(unique_postcodes))) as pool:
             for pc, records in pool.map(_epc_for_postcode, unique_postcodes):
                 epc_by_postcode[pc] = records
-        print(f"  [street] EPC fetched for {len(epc_by_postcode)} postcodes")
 
     # ── Step 4: Match each sale to its best EPC cert number ──────────────
     cert_for_sale: list = [None] * len(sales)
@@ -1352,16 +1232,14 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
         records = epc_by_postcode.get(pc, [])
         if not records:
             continue
-        best_score, best_cert, best_rec_obj, best_date = 0, None, None, ""
+        best_score, best_cert, best_rec_obj = 0, None, None
         for rec in records:
             sc = _epc_match_score(sale["address"], rec,
                                   paon=sale["paon"], saon=sale["saon"])
-            rec_date = rec.get("registrationDate") or rec.get("inspection-date") or ""
-            if sc > best_score or (sc == best_score and sc > 0 and rec_date > best_date):
+            if sc > best_score:
                 best_score = sc
                 best_cert = rec.get("certificateNumber") or rec.get("lmkKey")
                 best_rec_obj = rec
-                best_date = rec_date
         if best_cert and best_score > 0:
             cert_for_sale[idx] = best_cert
             raw_rec_for_cert[best_cert] = best_rec_obj
@@ -1380,7 +1258,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
         with ThreadPoolExecutor(max_workers=min(5, len(unique_certs))) as pool:
             for cert, detail in pool.map(_get_detail, unique_certs):
                 cert_detail[cert] = detail
-        print(f"  [street] scraped EPC detail for {len(cert_detail)} unique certs")
 
     # ── Step 6: Apply floor area + EPC metadata to each sale ─────────────
     for idx, sale in enumerate(sales):
@@ -1435,7 +1312,6 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
         "sqm_missing":    len(sales) - len(sqm_sales),
     }
 
-    print(f"  [street] done: {len(sales)} sales, {len(sqm_sales)} with area")
     return {
         "found":  True,
         "street": street,

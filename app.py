@@ -183,7 +183,7 @@ from scheduler import start_scheduler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins="*")
 
 # Create new DB tables (property_listings, scraper_runs) if they don't exist yet.
 # Wrapped in try/except so Flask still starts if the DB is temporarily busy.

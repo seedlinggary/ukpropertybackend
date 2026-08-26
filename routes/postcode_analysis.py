@@ -258,13 +258,21 @@ def get_postcode_analysis():
     if not postcode:
         return jsonify({"error": "Invalid or missing postcode"}), 400
 
-    # LR data + geocode in parallel
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f_lr      = pool.submit(_build_prop_sales, postcode)
-        f_geocode = pool.submit(_geocode, postcode)
+    try:
+        # LR data + geocode in parallel
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_lr      = pool.submit(_build_prop_sales, postcode)
+            f_geocode = pool.submit(_geocode, postcode)
 
-    prop_sales, main_street = f_lr.result()
-    lat, lng                = f_geocode.result()
+        prop_sales, main_street = f_lr.result()
+        lat, lng                = f_geocode.result()
+    except Exception:
+        logger.exception("[postcode_analysis] LR/geocode fetch failed for %s", postcode)
+        return jsonify({
+            "found": False, "postcode": postcode, "lat": None, "lng": None,
+            "stats": {}, "properties": [], "main_street": "",
+            "error": "Data fetch failed — please try again", "ownership_count": 0,
+        })
 
     if not prop_sales:
         return jsonify({
@@ -308,7 +316,10 @@ def get_postcode_analysis():
     def _epc_for_prop(item):
         key, ref_sale = item
         try:
-            result  = _fetch_epc(postcode, ref_sale["address"])
+            result  = _fetch_epc(
+                postcode, ref_sale["address"],
+                paon=ref_sale.get("paon"), saon=ref_sale.get("saon"),
+            )
             records = result.get("records", []) if result.get("found") else []
             return key, records
         except Exception:
@@ -469,7 +480,10 @@ def _stream_epc(postcode: str):
         key, ref_sale = item
         prop_postcode = ref_sale.get("postcode") or postcode
         try:
-            result  = _fetch_epc(prop_postcode, ref_sale["address"])
+            result  = _fetch_epc(
+                prop_postcode, ref_sale["address"],
+                paon=ref_sale.get("paon"), saon=ref_sale.get("saon"),
+            )
             records = result.get("records", []) if result.get("found") else []
             return key, records, ref_sale
         except Exception:

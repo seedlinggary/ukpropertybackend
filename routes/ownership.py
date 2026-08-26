@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import base64
 import json as _json
+from concurrent.futures import ThreadPoolExecutor
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
@@ -601,6 +602,44 @@ def companies_house_charges(company_number: str):
         return jsonify({"error": str(exc), "error_type": "server_error", "items": []}), 200
 
 
+@ownership_bp.route("/api/ownership/ch-company-search")
+def ch_company_search():
+    """Search Companies House company registry by name — used as a fallback when HMLR has 0 results."""
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": "no_api_key", "items": [], "total": 0}), 200
+
+    q = request.args.get("q", "").strip()
+    if len(q) < 2:
+        return jsonify({"items": [], "total": 0}), 200
+
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+    try:
+        qs_str = urllib.parse.urlencode({"q": q, "items_per_page": "20"})
+        data = _ch_get(
+            f"https://api.company-information.service.gov.uk/search/companies?{qs_str}",
+            creds, timeout=8,
+        )
+        items = []
+        for item in data.get("items", []):
+            items.append({
+                "company_name":     item.get("title", ""),
+                "company_number":   item.get("company_number", ""),
+                "company_status":   item.get("company_status", ""),
+                "company_type":     item.get("company_type", ""),
+                "date_of_creation": item.get("date_of_creation"),
+                "address_snippet":  item.get("address_snippet", ""),
+            })
+        return jsonify({"items": items, "total": data.get("total_results", len(items))})
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return jsonify({"error": "auth_error", "items": [], "total": 0}), 200
+        return jsonify({"error": f"CH returned {e.code}", "items": [], "total": 0}), 200
+    except Exception as exc:
+        logger.exception("[ownership] ch-company-search error")
+        return jsonify({"error": str(exc), "items": [], "total": 0}), 200
+
+
 @ownership_bp.route("/api/ownership/stats")
 @_db_retry()
 def get_stats():
@@ -623,3 +662,275 @@ def get_stats():
     except Exception as exc:
         logger.exception("[ownership] stats error")
         return jsonify({"error": str(exc), "total": 0, "last_import": None})
+
+
+# ---------------------------------------------------------------------------
+# Person / officer name search  (via Companies House officers search API)
+# ---------------------------------------------------------------------------
+
+@ownership_bp.route("/api/ownership/person-search")
+def person_search():
+    """Search Companies House for persons (officers/directors) by name."""
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": "COMPANIES_HOUSE_API_KEY not set", "error_type": "no_api_key", "officers": []}), 200
+
+    q = request.args.get("q", "").strip()
+    if not q or len(q) < 2:
+        return jsonify({"error": "q must be at least 2 characters", "officers": []}), 400
+
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+    try:
+        qs_str = urllib.parse.urlencode({"q": q, "items_per_page": "20"})
+        data = _ch_get(
+            f"https://api.company-information.service.gov.uk/search/officers?{qs_str}",
+            creds, timeout=8,
+        )
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return jsonify({"error": "Invalid API key", "error_type": "auth_error", "officers": []}), 200
+        return jsonify({"error": f"Companies House returned {e.code}", "error_type": "api_error", "officers": []}), 200
+    except Exception as exc:
+        logger.exception("[ownership] person-search error")
+        return jsonify({"error": str(exc), "error_type": "server_error", "officers": []}), 200
+
+    items = data.get("items", [])
+    officers = []
+    for item in items:
+        dob = item.get("date_of_birth") or {}
+        # CH search API returns links.self = "/officers/<id>/appointments"
+        self_url = (item.get("links") or {}).get("self", "")
+        officer_id = ""
+        if self_url:
+            parts = self_url.strip("/").split("/")
+            # ["officers", "<id>", "appointments"]
+            if len(parts) >= 2 and parts[0] == "officers":
+                officer_id = parts[1]
+        officers.append({
+            "name":            item.get("title", ""),
+            "description":     item.get("description", ""),
+            "address_snippet": item.get("address_snippet", ""),
+            "dob_month":       dob.get("month"),
+            "dob_year":        dob.get("year"),
+            "officer_id":      officer_id,
+        })
+
+    return jsonify({
+        "officers": officers,
+        "total":    data.get("total_results", len(items)),
+    })
+
+
+@ownership_bp.route("/api/ownership/person-appointments/<officer_id>")
+def person_appointments(officer_id: str):
+    """Return all company appointments for a CH officer (paginated), enriched with title counts."""
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": "no_api_key", "items": []}), 200
+
+    clean = re.sub(r"[^A-Za-z0-9_\-]", "", officer_id)
+    if not clean:
+        return jsonify({"error": "Invalid officer ID", "items": []}), 400
+
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+
+    # Paginate through all appointments — CH defaults to ~35 per page
+    items: list = []
+    total_results = 0
+    start_index = 0
+    page_size = 50
+    while True:
+        try:
+            data = _ch_get(
+                f"https://api.company-information.service.gov.uk/officers/{clean}/appointments"
+                f"?items_per_page={page_size}&start_index={start_index}",
+                creds, timeout=10,
+            )
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return jsonify({"items": [], "total_results": 0}), 200
+            return jsonify({"error": f"CH returned {e.code}", "items": []}), 200
+        except Exception as exc:
+            logger.exception("[ownership] person-appointments error")
+            return jsonify({"error": str(exc), "items": []}), 200
+
+        page_items = data.get("items", [])
+        if not items:
+            total_results = data.get("total_results", 0)
+        items.extend(page_items)
+        start_index += len(page_items)
+        # Stop when we have all results or hit the cap (200 to protect against abuse)
+        if not page_items or start_index >= total_results or start_index >= 200:
+            break
+    company_numbers = list({
+        (i.get("appointed_to") or {}).get("company_number", "").upper()
+        for i in items
+        if (i.get("appointed_to") or {}).get("company_number")
+    })
+
+    title_counts: dict = {}
+    if company_numbers:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SET statement_timeout = '5s'"))
+                placeholders = ", ".join(f":c{i}" for i, _ in enumerate(company_numbers))
+                params = {f"c{i}": cn for i, cn in enumerate(company_numbers)}
+                rows = conn.execute(text(f"""
+                    SELECT company_number, COUNT(*) AS cnt
+                    FROM company_ownership
+                    WHERE company_number IN ({placeholders})
+                    GROUP BY company_number
+                """), params).fetchall()
+                title_counts = {r[0]: int(r[1]) for r in rows}
+        except Exception as exc:
+            logger.warning("[ownership] person-appointments title count query failed: %s", exc)
+
+    result_items = []
+    for item in items:
+        at = item.get("appointed_to") or {}
+        cn = at.get("company_number", "").upper()
+        result_items.append({
+            "company_name":         at.get("company_name", ""),
+            "company_number":       cn,
+            "company_status":       at.get("company_status", ""),
+            "company_type":         at.get("company_type", ""),
+            "role":                 item.get("officer_role", ""),
+            "appointed_on":         item.get("appointed_on"),
+            "resigned_on":          item.get("resigned_on"),
+            "nationality":          item.get("nationality"),
+            "occupation":           item.get("occupation"),
+            "country_of_residence": item.get("country_of_residence"),
+            "is_pre_1992":          item.get("is_pre_1992_appointment", False),
+            "title_count":          title_counts.get(cn, 0),
+        })
+
+    return jsonify({
+        "items":         result_items,
+        "total_results": data.get("total_results", len(items)),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Company network — related entities via shared directors/officers
+# ---------------------------------------------------------------------------
+
+@ownership_bp.route("/api/ownership/company-network/<company_number>")
+def company_network(company_number: str):
+    """
+    Return all companies related to <company_number> via shared active officers.
+    Steps:
+      1. Fetch company officers from CH (active only, up to 15)
+      2. For each officer, fetch their other appointments concurrently (max 5 workers)
+      3. Deduplicate related company_numbers, query DB for title counts
+      4. Sort by title_count desc
+    """
+    api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
+    if not api_key:
+        return jsonify({"error": "no_api_key", "error_type": "no_api_key", "related": []}), 200
+
+    clean = re.sub(r"[^A-Za-z0-9]", "", company_number).upper()
+    if not clean:
+        return jsonify({"error": "Invalid company number", "related": []}), 400
+
+    creds = base64.b64encode(f"{api_key}:".encode()).decode()
+
+    # Step 1: officers for this company
+    try:
+        officers_data = _ch_get(
+            f"https://api.company-information.service.gov.uk/company/{clean}/officers"
+            f"?items_per_page=20&register_type=directors",
+            creds, timeout=8,
+        )
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return jsonify({"related": [], "officer_count": 0, "company_number": clean}), 200
+        return jsonify({"error": f"CH returned {e.code}", "related": []}), 200
+    except Exception as exc:
+        logger.warning("[ownership] company-network officers fetch failed: %s", exc)
+        return jsonify({"error": str(exc), "related": []}), 200
+
+    all_officers = officers_data.get("items", [])
+    # Active officers only (no resigned_on), cap at 15 to limit downstream calls
+    active_officers = [o for o in all_officers if not o.get("resigned_on")][:15]
+
+    def _extract_officer_id(officer: dict) -> str:
+        links = officer.get("links") or {}
+        officer_links = links.get("officer", {})
+        appts_url = officer_links.get("appointments", "") if isinstance(officer_links, dict) else ""
+        if not appts_url:
+            return ""
+        parts = appts_url.strip("/").split("/")
+        return parts[1] if len(parts) >= 2 and parts[0] == "officers" else ""
+
+    def _get_appointments(officer: dict) -> tuple:
+        name = officer.get("name", "")
+        role = officer.get("officer_role", "")
+        oid = _extract_officer_id(officer)
+        if not oid:
+            return name, role, []
+        try:
+            data = _ch_get(
+                f"https://api.company-information.service.gov.uk/officers/{oid}/appointments"
+                f"?items_per_page=50",
+                creds, timeout=6,
+            )
+            return name, role, data.get("items", [])
+        except Exception:
+            return name, role, []
+
+    # Step 2: concurrent appointment fetches
+    # related: company_number -> {company_name, company_status, via: set of officer names}
+    related: dict = {}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for officer_name, officer_role, appts in pool.map(_get_appointments, active_officers):
+            for appt in appts:
+                at = appt.get("appointed_to") or {}
+                cn = at.get("company_number", "").upper()
+                if not cn or cn == clean:
+                    continue
+                if cn not in related:
+                    related[cn] = {
+                        "company_name":   at.get("company_name", ""),
+                        "company_number": cn,
+                        "company_status": at.get("company_status", ""),
+                        "via": set(),
+                    }
+                related[cn]["via"].add(officer_name)
+
+    # Step 3: single DB query for title counts
+    company_numbers = list(related.keys())
+    title_counts: dict = {}
+    if company_numbers:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SET statement_timeout = '5s'"))
+                placeholders = ", ".join(f":c{i}" for i, _ in enumerate(company_numbers))
+                params = {f"c{i}": cn for i, cn in enumerate(company_numbers)}
+                rows = conn.execute(text(f"""
+                    SELECT company_number, COUNT(*) AS cnt
+                    FROM company_ownership
+                    WHERE company_number IN ({placeholders})
+                    GROUP BY company_number
+                """), params).fetchall()
+                title_counts = {r[0]: int(r[1]) for r in rows}
+        except Exception as exc:
+            logger.warning("[ownership] company-network title count query failed: %s", exc)
+
+    # Step 4: build and sort result
+    result = []
+    for cn, info in related.items():
+        result.append({
+            "company_name":   info["company_name"],
+            "company_number": cn,
+            "company_status": info["company_status"],
+            "via":            sorted(info["via"]),
+            "title_count":    title_counts.get(cn, 0),
+        })
+    result.sort(key=lambda x: (-x["title_count"], x["company_name"]))
+
+    return jsonify({
+        "related":       result,
+        "officer_count": len(active_officers),
+        "company_number": clean,
+    })
