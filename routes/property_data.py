@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 property_data_bp = Blueprint("property_data", __name__)
 
 EPC_BEARER = os.getenv("EPC_BEARER_TOKEN", "")
-TIMEOUT = 8
+TIMEOUT = 5  # gunicorn worker timeout is 120s; keep individual calls short so stalls don't pile up
 
 # ---------------------------------------------------------------------------
 # In-memory response cache: keyed by (lat 3dp, lng 3dp) → property data dict
@@ -451,7 +451,7 @@ def _fetch_epc_detail(cert_number: str, raw_rec: dict | None = None) -> dict:
         return {"found": False, "error": "bs4 not installed"}
     try:
         url = f"https://find-energy-certificate.service.gov.uk/energy-certificate/{cert_number}"
-        r = requests.get(url, timeout=12, headers={
+        r = requests.get(url, timeout=8, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         })
@@ -1334,7 +1334,7 @@ def _street_from_postcode(postcode: str) -> tuple:
         r = requests.get(
             "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
             params={"propertyAddress.postcode": postcode, "_pageSize": 20, "_page": 0},
-            timeout=8,
+            timeout=TIMEOUT,
         )
         items = r.json().get("result", {}).get("items", [])
     except Exception:
