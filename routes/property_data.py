@@ -35,6 +35,16 @@ property_data_bp = Blueprint("property_data", __name__)
 EPC_BEARER = os.getenv("EPC_BEARER_TOKEN", "")
 TIMEOUT = 5  # gunicorn worker timeout is 120s; keep individual calls short so stalls don't pile up
 
+# Browser-like headers for Land Registry linked-data API — server/bot IPs often get blocked without them
+_LR_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
 # ---------------------------------------------------------------------------
 # In-memory response cache: keyed by (lat 3dp, lng 3dp) → property data dict
 # 3 decimal places ≈ 110m precision, which is fine for postcode-level lookups.
@@ -658,10 +668,12 @@ def _fetch_sales(postcode: str) -> dict:
                 "_pageSize": 10,
                 "_sort": "-transactionDate",
             },
-            headers={"Accept": "application/json"},
+            headers=_LR_HEADERS,
             timeout=TIMEOUT,
         )
         if not r.ok:
+            logger.warning("[fetch_sales] LR HTTP %d for postcode %s — %.200s",
+                           r.status_code, postcode, r.text)
             return {"found": False, "error": f"Land Registry API {r.status_code}"}
 
         items = (r.json() or {}).get("result", {}).get("items", [])
@@ -1123,16 +1135,19 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
             r = requests.get(
                 "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
                 params=params,
-                headers={"Accept": "application/json"},
+                headers=_LR_HEADERS,
                 timeout=TIMEOUT,
             )
             if not r.ok:
+                logger.warning("[street_sales] LR HTTP %d for street=%s — %.200s",
+                               r.status_code, street, r.text)
                 break
             items = (r.json() or {}).get("result", {}).get("items", [])
             all_items.extend(items)
             if len(items) < 100:
                 break
         except Exception as exc:
+            logger.warning("[street_sales] LR request error: %s", exc)
             break
 
     if not all_items:
@@ -1145,11 +1160,13 @@ def _fetch_street_sales(street: str, town: str = "", district: str = "") -> dict
                 r = requests.get(
                     "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
                     params=params_no_town,
-                    headers={"Accept": "application/json"},
+                    headers=_LR_HEADERS,
                     timeout=TIMEOUT,
                 )
                 if r.ok:
                     all_items = (r.json() or {}).get("result", {}).get("items", [])
+                else:
+                    logger.warning("[street_sales] LR no-town HTTP %d — %.200s", r.status_code, r.text)
             except Exception:
                 pass
 
@@ -1334,10 +1351,15 @@ def _street_from_postcode(postcode: str) -> tuple:
         r = requests.get(
             "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
             params={"propertyAddress.postcode": postcode, "_pageSize": 20, "_page": 0},
+            headers=_LR_HEADERS,
             timeout=TIMEOUT,
         )
+        if not r.ok:
+            logger.warning("[street_from_postcode] LR HTTP %d — %.200s", r.status_code, r.text)
+            return "", "", district
         items = r.json().get("result", {}).get("items", [])
-    except Exception:
+    except Exception as exc:
+        logger.warning("[street_from_postcode] LR error: %s", exc)
         return "", "", district
 
     sc, tc = Counter(), Counter()

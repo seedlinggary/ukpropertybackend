@@ -212,6 +212,44 @@ def home():
     return "hello world"
 
 
+@app.route("/api/diagnostic/lr-test", methods=["GET"])
+def lr_test():
+    """Quick prod diagnostic: tells you exactly what landregistry.data.gov.uk returns."""
+    import requests as _req
+    postcode = request.args.get("postcode", "SW1A 1AA")
+    ua = request.args.get("ua", "browser")  # ?ua=python to test without User-Agent override
+    headers = {"Accept": "application/json"}
+    if ua != "python":
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+    try:
+        r = _req.get(
+            "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
+            params={"propertyAddress.postcode": postcode, "_pageSize": 3, "_page": 0},
+            headers=headers,
+            timeout=10,
+        )
+        try:
+            body = r.json()
+            items = (body or {}).get("result", {}).get("items", [])
+            item_count = len(items) if isinstance(items, list) else "n/a"
+        except Exception:
+            body = None
+            item_count = "json_parse_error"
+        return jsonify({
+            "http_status": r.status_code,
+            "ok": r.ok,
+            "content_type": r.headers.get("Content-Type", ""),
+            "item_count": item_count,
+            "body_snippet": r.text[:600],
+            "user_agent_sent": headers.get("User-Agent", "python-requests default"),
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc), "type": type(exc).__name__})
+
+
 @app.route("/location", methods=["POST"])
 def location():
     data = request.get_json()

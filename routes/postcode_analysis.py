@@ -66,6 +66,16 @@ def _geocode(postcode: str) -> tuple:
     return None, None
 
 
+_LR_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+
+
 def _fetch_lr_sales(postcode: str) -> list:
     all_items: list = []
     for page in range(3):
@@ -78,10 +88,12 @@ def _fetch_lr_sales(postcode: str) -> list:
                     "_sort": "-transactionDate",
                     "_page": page,
                 },
-                headers={"Accept": "application/json"},
+                headers=_LR_HEADERS,
                 timeout=TIMEOUT,
             )
             if not r.ok:
+                logger.warning("[postcode_analysis] LR HTTP %d for postcode %s — body: %.200s",
+                               r.status_code, postcode, r.text)
                 break
             items = (r.json() or {}).get("result", {}).get("items", [])
             all_items.extend(items)
@@ -106,10 +118,11 @@ def _fetch_lr_sales_by_street(street: str, town: str) -> list:
                     "_sort": "-transactionDate",
                     "_page": page,
                 },
-                headers={"Accept": "application/json"},
+                headers=_LR_HEADERS,
                 timeout=TIMEOUT,
             )
             if not r.ok:
+                logger.warning("[postcode_analysis] LR street HTTP %d — %s/%s", r.status_code, street, town)
                 break
             items = (r.json() or {}).get("result", {}).get("items", [])
             all_items.extend(items)
