@@ -214,5 +214,7 @@ def get_property(property_id: str):
         except OperationalError:
             if attempt == 2:
                 return jsonify({"error": "DB connection failed after retries"}), 503
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 400
         finally:
             session.close()

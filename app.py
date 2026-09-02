@@ -178,6 +178,8 @@ from routes.property_data import property_data_bp
 from routes.ownership import ownership_bp
 from routes.postcode_analysis import postcode_analysis_bp
 from routes.ai_search import ai_search_bp
+from routes.intelligence import intelligence_bp
+from routes.planning import planning_bp
 from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -198,6 +200,8 @@ app.register_blueprint(property_data_bp)
 app.register_blueprint(ownership_bp)
 app.register_blueprint(postcode_analysis_bp)
 app.register_blueprint(ai_search_bp)
+app.register_blueprint(intelligence_bp)
+app.register_blueprint(planning_bp)
 
 # Start the 12-hour background scheduler.
 # Called here (module level) so it runs under gunicorn too, not just `python app.py`.

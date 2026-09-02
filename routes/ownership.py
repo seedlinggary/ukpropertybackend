@@ -531,16 +531,10 @@ def companies_house_lookup(company_number: str):
     name  = request.args.get("name", "").strip()
     creds = base64.b64encode(f"{api_key}:".encode()).decode()
 
-    # Name is the reliable identifier; HMLR numbers are not.
-    # When a name is supplied, resolve via CH name search first so we always
-    # fetch the correct company — even when the HMLR number belongs to an
-    # entirely different company on CH (a known data quality issue in HMLR).
-    if name:
-        resolved = _ch_resolve_name(name, creds)
-        lookup_num = resolved if resolved else clean
-    else:
-        lookup_num = clean
-
+    # Strategy: always try the company number directly first — it is authoritative
+    # when coming from CH appointments or any caller that knows the correct number.
+    # Only fall back to name-based resolution when the direct lookup returns 404,
+    # which covers the HMLR case where company numbers can be stale or incorrect.
     def _fetch(num):
         return _ch_get(
             f"https://api.company-information.service.gov.uk/company/{num}",
@@ -548,10 +542,19 @@ def companies_house_lookup(company_number: str):
         )
 
     try:
-        return jsonify(_fetch(lookup_num))
+        return jsonify(_fetch(clean))
     except urllib.error.HTTPError as e:
         if e.code == 401:
             return jsonify({"error": "Invalid API key", "error_type": "auth_error"}), 200
+        if e.code == 404 and name:
+            # Number not found — try resolving via name (HMLR fallback)
+            resolved = _ch_resolve_name(name, creds)
+            if resolved and resolved != clean:
+                try:
+                    return jsonify(_fetch(resolved))
+                except urllib.error.HTTPError:
+                    pass
+            return jsonify({"error": "Company not found", "error_type": "not_found"}), 200
         if e.code == 404:
             return jsonify({"error": "Company not found", "error_type": "not_found"}), 200
         return jsonify({"error": f"Companies House returned {e.code}", "error_type": "api_error"}), 200
@@ -573,15 +576,7 @@ def companies_house_charges(company_number: str):
     if not clean or len(clean) > 10:
         return jsonify({"error": "Invalid company number", "items": []}), 400
 
-    name  = request.args.get("name", "").strip()
     creds = base64.b64encode(f"{api_key}:".encode()).decode()
-
-    # Same name-first resolution as the company profile endpoint.
-    if name:
-        resolved = _ch_resolve_name(name, creds)
-        lookup_num = resolved if resolved else clean
-    else:
-        lookup_num = clean
 
     def _fetch(num):
         return _ch_get(
@@ -590,7 +585,7 @@ def companies_house_charges(company_number: str):
         )
 
     try:
-        return jsonify(_fetch(lookup_num))
+        return jsonify(_fetch(clean))
     except urllib.error.HTTPError as e:
         if e.code == 401:
             return jsonify({"error": "Invalid API key", "error_type": "auth_error", "items": []}), 200
@@ -623,12 +618,13 @@ def ch_company_search():
         items = []
         for item in data.get("items", []):
             items.append({
-                "company_name":     item.get("title", ""),
-                "company_number":   item.get("company_number", ""),
-                "company_status":   item.get("company_status", ""),
-                "company_type":     item.get("company_type", ""),
-                "date_of_creation": item.get("date_of_creation"),
-                "address_snippet":  item.get("address_snippet", ""),
+                "company_name":      item.get("title", ""),
+                "company_number":    item.get("company_number", ""),
+                "company_status":    item.get("company_status", ""),
+                "company_type":      item.get("company_type", ""),
+                "date_of_creation":  item.get("date_of_creation"),
+                "date_of_cessation": item.get("date_of_cessation"),
+                "address_snippet":   item.get("address_snippet", ""),
             })
         return jsonify({"items": items, "total": data.get("total_results", len(items))})
     except urllib.error.HTTPError as e:
