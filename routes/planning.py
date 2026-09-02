@@ -331,46 +331,53 @@ def _geocode(postcode: str) -> tuple[float, float, str, str]:
 # ─── Datasette search ─────────────────────────────────────────────────────────
 
 
-def _fetch_via_datasette(search_term: str | None, limit: int = 50) -> tuple[list[dict], bool]:
+def _datasette_sql(search_term: str | None, limit: int, la_entity: int | None) -> str:
+    """Build datasette SQL, optionally filtered to a single LPA entity."""
+    entity_clause = f" AND organisation_entity = {la_entity}" if la_entity else ""
+    keyword_clause = f" AND json LIKE '%{search_term}%'" if search_term else ""
+    return (
+        f"SELECT entity, reference, organisation_entity, json "
+        f"FROM entity "
+        f"WHERE json LIKE '%decision-date%'{keyword_clause}{entity_clause} "
+        f"ORDER BY entity DESC LIMIT {limit}"
+    )
+
+
+def _fetch_via_datasette(search_term: str | None, limit: int = 50, la_entity: int | None = None) -> tuple[list[dict], bool]:
     """
     Query datasette for planning applications.
-    Filters to applications that have a decision-date (i.e., decided).
+    When la_entity is given, tries local-council results first; falls back to
+    national if the council contributes no data to the dataset.
     Returns (list_of_raw_rows, timed_out).
     """
     _load_la_cache()
 
-    if search_term:
-        sql = (
-            f"SELECT entity, reference, organisation_entity, json "
-            f"FROM entity "
-            f"WHERE json LIKE '%decision-date%' AND json LIKE '%{search_term}%' "
-            f"ORDER BY entity DESC LIMIT {limit}"
-        )
-    else:
-        sql = (
-            f"SELECT entity, reference, organisation_entity, json "
-            f"FROM entity "
-            f"WHERE json LIKE '%decision-date%' "
-            f"ORDER BY entity DESC LIMIT {limit}"
-        )
-
-    try:
-        r = _req.get(
-            f"{DATASETTE_BASE}/planning-application.json",
-            params={"sql": sql, "_shape": "array"},
-            headers={"Accept": "application/json", "User-Agent": "PropSearch/1.0"},
-            timeout=DATASETTE_TIMEOUT,
-        )
-        if r.status_code == 400:
-            log.warning(f"[planning] datasette timeout for term={search_term!r}")
-            return [], True
-        if not r.ok:
-            log.warning(f"[planning] datasette HTTP {r.status_code}")
+    def _run(sql: str) -> tuple[list, bool]:
+        try:
+            r = _req.get(
+                f"{DATASETTE_BASE}/planning-application.json",
+                params={"sql": sql, "_shape": "array"},
+                headers={"Accept": "application/json", "User-Agent": "PropSearch/1.0"},
+                timeout=DATASETTE_TIMEOUT,
+            )
+            if r.status_code == 400:
+                log.warning(f"[planning] datasette timeout for term={search_term!r}")
+                return [], True
+            if not r.ok:
+                log.warning(f"[planning] datasette HTTP {r.status_code}")
+                return [], False
+            return r.json(), False
+        except Exception as e:
+            log.warning(f"[planning] datasette request failed: {e}")
             return [], False
-        return r.json(), False
-    except Exception as e:
-        log.warning(f"[planning] datasette request failed: {e}")
-        return [], False
+
+    # When we know the user's council, only return results from that council.
+    # If the council contributes no data to the national dataset, return nothing
+    # from datasette (IDOX results from the council portal still come through separately).
+    if la_entity is not None:
+        return _run(_datasette_sql(search_term, limit, la_entity))
+
+    return _run(_datasette_sql(search_term, limit, None))
 
 
 import json as _json
@@ -491,18 +498,23 @@ def planning_search():
     sources_queried = ["datasette.planning.data.gov.uk (MHCLG)"]
 
     with _cf.ThreadPoolExecutor(max_workers=2) as pool:
-        f_datasette = pool.submit(_fetch_via_datasette, search_term, query_limit)
-        # Run IDOX in parallel if the council has a portal AND there's a keyword
-        # For 'any' / 'new_build' (no keyword) IDOX would return too many results
+        f_datasette = pool.submit(_fetch_via_datasette, search_term, query_limit, user_la_entity)
+        # Run IDOX whenever the council has a portal.
+        # For types with no keyword ("any", "new_build"), pass "" — the narrowing loop
+        # handles "too many results" by progressively shrinking the date window.
         f_idox = None
-        if council_portal and search_term:
+        if council_portal:
             matched_key, portal_url = council_portal
-            f_idox = pool.submit(idox_search, matched_key, portal_url, search_term)
+            idox_keyword = search_term or ""
+            # For keyworded types start with 2yr window; for empty keyword start with
+            # 30 days to avoid many narrowing iterations under the request timeout.
+            idox_init_days = 730 if search_term else 30
+            f_idox = pool.submit(idox_search, matched_key, portal_url, idox_keyword, 20, idox_init_days)
 
         rows, timed_out = f_datasette.result()
         if f_idox is not None:
             try:
-                idox_results = f_idox.result(timeout=15) or []
+                idox_results = f_idox.result(timeout=30) or []
                 if idox_results:
                     sources_queried.append(f"{council_portal[0]} Planning Portal (IDOX)")
             except Exception:

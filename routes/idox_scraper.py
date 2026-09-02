@@ -522,21 +522,21 @@ def idox_search(
     base_url: str,
     keyword: str,
     timeout: int = 10,
+    initial_days: int = 730,
 ) -> list[dict]:
     """
     Search one IDOX portal for applications matching the keyword.
     Returns a list of result dicts in our standard shape, or empty list on failure.
     The keyword is searched across description, address, and reference.
-    Date range: last 2 years to limit results.
+    initial_days controls the starting date window; use a smaller value (e.g. 30)
+    for empty-keyword searches to avoid many narrowing iterations.
     """
     if _is_failed(base_url):
         return []
 
-    # Rolling 2-year date window
     from datetime import date, timedelta
     today = date.today()
-    two_years_ago = today - timedelta(days=730)
-    date_from = two_years_ago.strftime("%d/%m/%Y")
+    date_from = (today - timedelta(days=initial_days)).strftime("%d/%m/%Y")
     date_to = today.strftime("%d/%m/%Y")
 
     try:
@@ -544,8 +544,8 @@ def idox_search(
         s.verify = False
         s.headers.update(_HEADERS)
 
-        # Step 1: GET the search form
-        r = s.get(f"{base_url}/search.do", params={"action": "simple"}, timeout=timeout)
+        # Step 1: GET the advanced search form (has date range fields; simple search does not)
+        r = s.get(f"{base_url}/search.do", params={"action": "advanced"}, timeout=timeout)
         if not r.ok:
             log.debug(f"[idox] {council_name} GET {r.status_code}")
             _mark_failed(base_url)
@@ -564,8 +564,8 @@ def idox_search(
             if i.get("name")
         }
 
-        # Resolve the POST URL — form action is usually an absolute path like
-        # "/online-applications/simpleSearchResults.do?action=firstPage"
+        # Resolve the POST URL — advanced form action is typically
+        # "/online-applications/advancedSearchResults.do?action=firstPage"
         form_action = form.get("action", "")
         parsed = urlparse(base_url)
         site_root = f"{parsed.scheme}://{parsed.netloc}"
@@ -576,14 +576,11 @@ def idox_search(
         else:
             post_url = f"{base_url}/{form_action.lstrip('/')}"
 
-        # Detect keyword field name (modern vs. legacy IDOX)
-        uses_simple = "simpleSearchString" in r.text or "simpleSearch" in r.text
-        keyword_field = (
-            "searchCriteria.simpleSearchString" if uses_simple
-            else "searchCriteria.description"
-        )
+        # Advanced search always uses searchCriteria.description for keyword
+        keyword_field = "searchCriteria.description"
 
-        # Step 2: POST search — filter to decided applications with date range
+        # Step 2: POST search — filter to decided applications with date range.
+        # The advanced form accepts date range fields directly; simple search ignores them.
         post_data = {
             **hidden,
             keyword_field: keyword,
@@ -591,97 +588,123 @@ def idox_search(
             "searchCriteria.caseStatus": "Decided",
             "date(applicationValidatedStart)": date_from,
             "date(applicationValidatedEnd)": date_to,
-            "searchCriteria.dateType": "applicationDate",
-            "searchCriteria.dateRangeType": "custom",
         }
-        if uses_simple:
-            post_data["searchCriteria.simpleSearch"] = "true"
 
-        s.headers["Referer"] = f"{base_url}/search.do?action=simple"
+        s.headers["Referer"] = f"{base_url}/search.do?action=advanced"
         s.headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        r2 = s.post(post_url, data=post_data, timeout=timeout + 5, allow_redirects=True)
-        if not r2.ok:
-            log.debug(f"[idox] {council_name} POST {r2.status_code}")
-            _mark_failed(base_url)
-            return []
+        # All possible "too many results" narrowing steps, used below
+        _ALL_NARROW = (365, 180, 90, 30, 14, 7, 3)
 
-        # If "too many results" — progressively narrow the date window.
-        # Re-fetch the search form each time to get a fresh CSRF token (some portals
-        # invalidate the token after the first POST).
-        for _days_back in (365, 180, 90, 30, 14):
-            if "too many results" not in r2.text.lower():
-                break
-            # Refresh CSRF token
-            r_fresh = s.get(f"{base_url}/search.do", params={"action": "simple"}, timeout=timeout)
-            if r_fresh.ok:
-                soup_fresh = BeautifulSoup(r_fresh.text, "lxml")
-                form_fresh = soup_fresh.find("form")
-                if form_fresh:
-                    fresh_hidden = {
-                        i["name"]: i.get("value", "")
-                        for i in form_fresh.find_all("input", {"type": "hidden"})
-                        if i.get("name")
-                    }
-                    post_data.update(fresh_hidden)
-            cutoff = today - timedelta(days=_days_back)
-            post_data["date(applicationValidatedStart)"] = cutoff.strftime("%d/%m/%Y")
+        def _refresh_csrf() -> None:
+            """Re-GET the advanced search form and update hidden (CSRF) fields in post_data."""
+            try:
+                rf = s.get(f"{base_url}/search.do", params={"action": "advanced"}, timeout=timeout)
+                if rf.ok:
+                    sf = BeautifulSoup(rf.text, "lxml")
+                    ff = sf.find("form")
+                    if ff:
+                        post_data.update({
+                            i["name"]: i.get("value", "")
+                            for i in ff.find_all("input", {"type": "hidden"})
+                            if i.get("name")
+                        })
+            except Exception:
+                pass
+
+        def _run_window(days: int):
+            """POST a search for the given window size, narrow if "too many results".
+            Returns the final requests.Response or None on HTTP error."""
+            post_data["date(applicationValidatedStart)"] = (today - timedelta(days=days)).strftime("%d/%m/%Y")
+            _refresh_csrf()
             r2 = s.post(post_url, data=post_data, timeout=timeout + 5, allow_redirects=True)
             if not r2.ok:
                 _mark_failed(base_url)
-                return []
-        if "too many results" in r2.text.lower():
-            log.debug(f"[idox] {council_name} still too many results after 14-day window")
-            return []
+                return None
+            # Narrow only within this window (never try a window wider than `days`)
+            narrow_steps = [d for d in _ALL_NARROW if d < days]
+            for _nb in narrow_steps:
+                if "too many results" not in r2.text.lower():
+                    break
+                post_data["date(applicationValidatedStart)"] = (today - timedelta(days=_nb)).strftime("%d/%m/%Y")
+                _refresh_csrf()
+                r2 = s.post(post_url, data=post_data, timeout=timeout + 5, allow_redirects=True)
+                if not r2.ok:
+                    _mark_failed(base_url)
+                    return None
+            return r2
+
+        def _has_results(html: str) -> bool:
+            """True when the page contains actual planning application result rows."""
+            s2 = BeautifulSoup(html, "lxml")
+            return bool(
+                s2.find("li", class_="searchresult") or
+                s2.find("ul", id="searchresults") or
+                s2.find("table", class_="results") or
+                s2.find("div", id="searchresults")
+            )
 
         def _is_bounce_back(html: str) -> bool:
             """True only when the portal rejected the search and returned the empty form.
-            Does NOT fire on legitimate "0 results found" or "too many results" pages.
+            Does NOT fire on legitimate "0 results", "too many results", or actual result pages.
             """
+            if _has_results(html):
+                return False
             s2 = BeautifulSoup(html, "lxml")
             body_text = s2.get_text(" ", strip=True).lower()
-
-            # Explicit "0 results" or "too many results" → legitimate portal response, not a bounce-back
             if re.search(r"(no results|0 result|your search (has )?returned no|no applications found|too many results)", body_text):
                 return False
-
-            # h1/h2 is the search form heading (search was not executed)
             h = s2.find("h1") or s2.find("h2")
             heading = h.get_text(strip=True).lower() if h else ""
             if any(phrase in heading for phrase in
-                   ("simple search", "search applications", "search for planning applications")):
-                # But only a bounce-back if the form keyword field is empty
+                   ("simple search", "advanced search", "search applications", "search for planning applications")):
                 kw_input = (
                     s2.find("input", {"name": "searchCriteria.simpleSearchString"}) or
                     s2.find("input", {"name": "searchCriteria.description"})
                 )
                 if kw_input and not (kw_input.get("value") or "").strip():
                     return True
-
             return False
 
-        if _is_bounce_back(r2.text):
-            # Fallback 1: drop caseStatus filter (some portals don't accept 'Decided')
-            pd2 = {k: v for k, v in post_data.items() if k != "searchCriteria.caseStatus"}
-            r2 = s.post(post_url, data=pd2, timeout=timeout + 5, allow_redirects=True)
+        # For keyword searches: one attempt at initial_days with narrowing.
+        # For empty-keyword searches: escalate 30 → 60 → 180 → 365 → 1095 days when 0 results.
+        windows = [initial_days] if keyword else [30, 60, 180, 365, 1095]
 
-        if r2.ok and _is_bounce_back(r2.text):
-            # Fallback 2: drop date range entirely, just keyword search
-            pd3 = {
-                k: v for k, v in post_data.items()
-                if k not in ("date(applicationValidatedStart)", "date(applicationValidatedEnd)",
-                             "searchCriteria.dateType", "searchCriteria.dateRangeType",
-                             "searchCriteria.caseStatus")
-            }
-            r2 = s.post(post_url, data=pd3, timeout=timeout + 5, allow_redirects=True)
+        for _win in windows:
+            r2 = _run_window(_win)
+            if r2 is None:
+                return []
 
-        if not r2.ok or _is_bounce_back(r2.text):
-            log.debug(f"[idox] {council_name} bounced back after all fallbacks")
-            return []
+            if "too many results" in r2.text.lower():
+                log.debug(f"[idox] {council_name} too many results even at min narrowing for {_win}d")
+                continue  # try next wider window
 
-        results = _parse_idox_results(r2.text, base_url, council_name)
-        log.info(f"[idox] {council_name}: {len(results)} results for keyword={keyword!r}")
-        return results[:20]  # cap at 20 per portal
+            # Bounce-back fallbacks
+            if _is_bounce_back(r2.text):
+                pd2 = {k: v for k, v in post_data.items() if k != "searchCriteria.caseStatus"}
+                r2 = s.post(post_url, data=pd2, timeout=timeout + 5, allow_redirects=True)
+
+            if r2.ok and _is_bounce_back(r2.text):
+                pd3 = {
+                    k: v for k, v in post_data.items()
+                    if k not in ("date(applicationValidatedStart)", "date(applicationValidatedEnd)",
+                                 "searchCriteria.dateType", "searchCriteria.dateRangeType",
+                                 "searchCriteria.caseStatus")
+                }
+                r2 = s.post(post_url, data=pd3, timeout=timeout + 5, allow_redirects=True)
+
+            if not r2.ok or _is_bounce_back(r2.text):
+                log.debug(f"[idox] {council_name} bounced back after all fallbacks for {_win}d")
+                continue  # try next wider window
+
+            results = _parse_idox_results(r2.text, base_url, council_name)
+            if results:
+                log.info(f"[idox] {council_name}: {len(results)} results in {_win}d window, keyword={keyword!r}")
+                return results[:20]
+
+            log.debug(f"[idox] {council_name} 0 results in {_win}d window — widening")
+
+        return []
 
     except requests.exceptions.Timeout:
         log.debug(f"[idox] {council_name} timeout")
