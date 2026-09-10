@@ -691,8 +691,33 @@ def person_search():
         return jsonify({"error": str(exc), "error_type": "server_error", "officers": []}), 200
 
     items = data.get("items", [])
+
+    # Fuzzy name filter — keep results whose first and last name tokens
+    # each START WITH the corresponding tokens from the query, so
+    # "nachm leifer" → matches "NACHM LEIFER", "NACHMAN LEIFER",
+    # "NACHMAN LEIFERSHTEIN" but not unrelated names.
+    q_tokens = q.lower().split()
+    def _name_matches(result_name: str) -> bool:
+        if not q_tokens:
+            return True
+        r_tokens = result_name.lower().split()
+        if not r_tokens:
+            return False
+        # Last token of query must be a prefix of the result's last token
+        q_last = q_tokens[-1]
+        if not any(t.startswith(q_last) for t in r_tokens):
+            return False
+        # All remaining query tokens must each have at least one result token prefix-match
+        for qt in q_tokens[:-1]:
+            if not any(t.startswith(qt) for t in r_tokens):
+                return False
+        return True
+
     officers = []
     for item in items:
+        name = item.get("title", "")
+        if not _name_matches(name):
+            continue
         dob = item.get("date_of_birth") or {}
         # CH search API returns links.self = "/officers/<id>/appointments"
         self_url = (item.get("links") or {}).get("self", "")
@@ -703,7 +728,8 @@ def person_search():
             if len(parts) >= 2 and parts[0] == "officers":
                 officer_id = parts[1]
         officers.append({
-            "name":            item.get("title", ""),
+            "name":            name,
+            "kind":            item.get("kind", "individual"),
             "description":     item.get("description", ""),
             "address_snippet": item.get("address_snippet", ""),
             "dob_month":       dob.get("month"),
@@ -713,7 +739,7 @@ def person_search():
 
     return jsonify({
         "officers": officers,
-        "total":    data.get("total_results", len(items)),
+        "total":    len(officers),
     })
 
 

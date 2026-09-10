@@ -21,6 +21,7 @@ import threading
 from flask import Blueprint, request, jsonify
 import requests as _req
 from .idox_scraper import find_council_portal, idox_search, IDOX_PORTALS
+from . import pins_loader
 
 log = logging.getLogger(__name__)
 
@@ -311,8 +312,8 @@ def _norm_decision(planning_decision: str, status: str, decision_date: str) -> s
 # ─── Geocode ──────────────────────────────────────────────────────────────────
 
 
-def _geocode(postcode: str) -> tuple[float, float, str, str]:
-    """Returns (lat, lng, normalised_postcode, admin_district) or raises ValueError."""
+def _geocode(postcode: str) -> tuple[float, float, str, str, str]:
+    """Returns (lat, lng, normalised_postcode, admin_district, ons_code) or raises ValueError."""
     clean = postcode.replace(" ", "").upper()
     try:
         r = _req.get(f"https://api.postcodes.io/postcodes/{clean}", timeout=6)
@@ -325,7 +326,8 @@ def _geocode(postcode: str) -> tuple[float, float, str, str]:
     lng = result["longitude"]
     norm_pc = result.get("postcode", clean)
     admin_district = result.get("admin_district", "")
-    return lat, lng, norm_pc, admin_district
+    ons_code = (result.get("codes") or {}).get("admin_district", "")
+    return lat, lng, norm_pc, admin_district, ons_code
 
 
 # ─── Datasette search ─────────────────────────────────────────────────────────
@@ -478,7 +480,7 @@ def planning_search():
 
     # 1. Geocode + identify user's LPA
     try:
-        lat, lng, norm_pc, admin_district = _geocode(postcode)
+        lat, lng, norm_pc, admin_district, ons_code = _geocode(postcode)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -519,6 +521,11 @@ def planning_search():
                     sources_queried.append(f"{council_portal[0]} Planning Portal (IDOX)")
             except Exception:
                 idox_results = []
+
+    # 2b. PINS appeal decisions (in-memory, instant once loaded)
+    pins_results, pins_stats, pins_loading = pins_loader.search(ons_code, admin_district, change_type, sample=50)
+    if pins_results:
+        sources_queried.append("Planning Inspectorate (PINS)")
 
     # 3. Parse rows
     results = _parse_rows(rows, user_la_entity)
@@ -602,6 +609,11 @@ def planning_search():
         "sources_queried": sources_queried,
         "idox_count": len(idox_results),
         "council_has_idox_portal": council_portal is not None,
+        "council_portal_url": council_portal[1] if council_portal else None,
+        "pins_results": pins_results,
+        "pins_count": len(pins_results),
+        "pins_stats": pins_stats,
+        "pins_loading": pins_loading,
     })
 
 
@@ -765,7 +777,7 @@ def planning_context():
         return jsonify({"error": "postcode is required"}), 400
 
     try:
-        _, _, norm_pc, admin_district = _geocode(postcode)
+        _, _, norm_pc, admin_district, _ = _geocode(postcode)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 

@@ -180,6 +180,7 @@ from routes.postcode_analysis import postcode_analysis_bp
 from routes.ai_search import ai_search_bp
 from routes.intelligence import intelligence_bp
 from routes.planning import planning_bp
+from routes.pins_loader import start_background_load as _start_pins
 from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -207,6 +208,9 @@ app.register_blueprint(planning_bp)
 # Called here (module level) so it runs under gunicorn too, not just `python app.py`.
 # start_scheduler() is idempotent — safe to call multiple times.
 start_scheduler()
+
+# Pre-load Planning Inspectorate appeals data in background (~50s first run).
+_start_pins()
 
 
 # --- existing routes (unchanged) ---
