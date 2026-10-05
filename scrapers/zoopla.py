@@ -220,11 +220,14 @@ def _scraperapi_get(url: str, api_key: str) -> Optional[str]:
 
 def _schema_items_from_html(html: str) -> List[dict]:
     """
-    Extract listing items from the lsrp-schema embedded in HTML.
+    Extract listing items from Zoopla's JSON-LD schema block.
 
-    Zoopla has used two formats:
-      New (2026+): <script id="lsrp-schema" type="application/ld+json">{JSON}</script>
-      Old (pre-2026): (self.__next_s||[]).push([0, {"children": "escaped JSON", "id": "lsrp-schema"}])
+    Zoopla has used three formats over time:
+      Current (late 2026+): plain <script type="application/ld+json"> with no id
+      Mid-2026:  <script id="lsrp-schema" type="application/ld+json">{JSON}</script>
+      Pre-2026:  (self.__next_s||[]).push([0, {"children": "escaped JSON", "id": "lsrp-schema"}])
+
+    All three embed the same @graph structure with a SearchResultsPage node.
     """
     def _items_from_graph(data: dict) -> List[dict]:
         for node in data.get("@graph", []):
@@ -233,7 +236,22 @@ def _schema_items_from_html(html: str) -> List[dict]:
                 return [el["item"] for el in elements if el.get("item")]
         return []
 
-    # New format: direct JSON in a standard ld+json script tag
+    # Current format (late 2026+): scan ALL ld+json script tags for SearchResultsPage
+    try:
+        for m in re.finditer(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.DOTALL,
+        ):
+            try:
+                items = _items_from_graph(json.loads(m.group(1).strip()))
+                if items:
+                    return items
+            except Exception:
+                continue
+    except Exception:
+        logger.debug("[zoopla] schema extraction (current format) failed", exc_info=True)
+
+    # Mid-2026 format: direct JSON in a tagged script with id="lsrp-schema"
     try:
         m = re.search(r'<script[^>]+id="lsrp-schema"[^>]*>(.*?)</script>', html, re.DOTALL)
         if m:
@@ -241,9 +259,9 @@ def _schema_items_from_html(html: str) -> List[dict]:
             if items:
                 return items
     except Exception:
-        logger.debug("[zoopla] schema extraction (new format) failed", exc_info=True)
+        logger.debug("[zoopla] schema extraction (mid-2026 format) failed", exc_info=True)
 
-    # Old format: JSON escaped inside a __next_s push
+    # Pre-2026 format: JSON escaped inside a __next_s push
     try:
         marker_idx = html.find('"id":"lsrp-schema"')
         if marker_idx != -1:
@@ -265,7 +283,7 @@ def _schema_items_from_html(html: str) -> List[dict]:
                 if items:
                     return items
     except Exception:
-        logger.debug("[zoopla] schema extraction (old format) failed", exc_info=True)
+        logger.debug("[zoopla] schema extraction (pre-2026 format) failed", exc_info=True)
 
     return []
 
@@ -404,10 +422,24 @@ def _wait_for_cloudflare(driver, timeout: int = 5) -> bool:
 
 def _dom_schema_items(driver) -> List[dict]:
     try:
-        raw = driver.execute_script(
-            "var el=document.getElementById('lsrp-schema');"
-            "return el ? el.textContent : null;"
-        )
+        # Try id-based lookup first (mid-2026 format), then fall back to scanning
+        # all ld+json script tags (current format — id no longer set).
+        raw = driver.execute_script("""
+            var el = document.getElementById('lsrp-schema');
+            if (el) return el.textContent;
+            var scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            for (var i = 0; i < scripts.length; i++) {
+                try {
+                    var d = JSON.parse(scripts[i].textContent);
+                    if (d && d['@graph']) {
+                        for (var j = 0; j < d['@graph'].length; j++) {
+                            if (d['@graph'][j]['@type'] === 'SearchResultsPage') return scripts[i].textContent;
+                        }
+                    }
+                } catch(e) {}
+            }
+            return null;
+        """)
         if not raw:
             return []
         for node in json.loads(raw).get("@graph", []):

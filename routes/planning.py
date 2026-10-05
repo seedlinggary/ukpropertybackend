@@ -617,6 +617,21 @@ def planning_search():
     })
 
 
+@planning_bp.route("/api/planning/pins-status")
+def pins_status():
+    """Diagnostic: confirm PINS loader state in this worker process."""
+    ready = pins_loader.is_ready()
+    row_count = len(pins_loader._rows)
+    ons_sample = list(pins_loader._by_ons.keys())[:5]
+    name_sample = list(pins_loader._by_name.keys())[:5]
+    return jsonify({
+        "ready": ready,
+        "row_count": row_count,
+        "ons_codes_sample": ons_sample,
+        "name_keys_sample": name_sample,
+    })
+
+
 # ─── Coverage data ────────────────────────────────────────────────────────────
 # Which councils have which types of planning data available.
 # Sourced empirically from the MHCLG national planning dataset.
