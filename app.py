@@ -171,7 +171,7 @@ from sqlalchemy import text
 
 from geoutils import check_point
 from database import engine
-from models import Base  # imports PropertyListing + ScraperRun into Base metadata
+from models import Base  # imports all models into Base metadata
 from routes.scraper import scraper_bp
 from routes.properties import properties_bp
 from routes.property_data import property_data_bp
@@ -180,20 +180,31 @@ from routes.postcode_analysis import postcode_analysis_bp
 from routes.ai_search import ai_search_bp
 from routes.intelligence import intelligence_bp
 from routes.planning import planning_bp
+from routes.auth import auth_bp
+from routes.users import users_bp
+from routes.admin import admin_bp
+from routes.stripe_routes import stripe_bp
+from routes.notes import notes_bp
+from routes.saved_searches import saved_searches_bp
+from routes.site_settings import site_settings_bp
+from routes.preferences import preferences_bp
+from routes.dismissed import dismissed_bp
+from routes.mortgage_rates import mortgage_rates_bp
+from routes.favorites import favorites_bp
 from routes.pins_loader import start_background_load as _start_pins
 from scheduler import start_scheduler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+_log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, origins="*")
 
-# Create new DB tables (property_listings, scraper_runs) if they don't exist yet.
-# Wrapped in try/except so Flask still starts if the DB is temporarily busy.
+# Create all DB tables (including new auth tables) if they don't exist yet.
 try:
     Base.metadata.create_all(bind=engine)
 except Exception as _e:
-    logging.getLogger(__name__).warning(f"create_all skipped (DB busy at startup): {_e}")
+    _log.warning(f"create_all skipped (DB busy at startup): {_e}")
 
 app.register_blueprint(scraper_bp)
 app.register_blueprint(properties_bp)
@@ -203,6 +214,96 @@ app.register_blueprint(postcode_analysis_bp)
 app.register_blueprint(ai_search_bp)
 app.register_blueprint(intelligence_bp)
 app.register_blueprint(planning_bp)
+app.register_blueprint(auth_bp)
+app.register_blueprint(users_bp)
+app.register_blueprint(admin_bp)
+app.register_blueprint(stripe_bp)
+app.register_blueprint(notes_bp)
+app.register_blueprint(saved_searches_bp)
+app.register_blueprint(site_settings_bp)
+app.register_blueprint(preferences_bp)
+app.register_blueprint(dismissed_bp)
+app.register_blueprint(mortgage_rates_bp)
+app.register_blueprint(favorites_bp)
+
+
+def _seed_default_tiers() -> None:
+    """Create the 3 default tiers if the tiers table is empty."""
+    from database import SessionLocal
+    from models.tier import Tier, TierFeature, KNOWN_FEATURES
+    session = SessionLocal()
+    try:
+        if session.query(Tier).count() > 0:
+            return
+        defaults = [
+            {"name": "free",       "display_name": "Free",       "sort_order": 0,
+             "price_monthly_cents": 0, "price_yearly_cents": 0,
+             "description": "Get started with core property search tools at no cost.",
+             "features": ["properties_search", "postcode_analysis", "calculators"]},
+            {"name": "pro",        "display_name": "Pro",        "sort_order": 1,
+             "price_monthly_cents": 2900, "price_yearly_cents": 27900,
+             "description": "Full access to ownership intelligence, planning data, and scrapers.",
+             "features": KNOWN_FEATURES},
+            {"name": "enterprise", "display_name": "Enterprise", "sort_order": 2,
+             "price_monthly_cents": 9900, "price_yearly_cents": 99900,
+             "description": "Unlimited access, priority support, and custom integrations.",
+             "features": KNOWN_FEATURES},
+        ]
+        for d in defaults:
+            tier = Tier(
+                name=d["name"], display_name=d["display_name"],
+                description=d["description"], sort_order=d["sort_order"],
+                price_monthly_cents=d["price_monthly_cents"],
+                price_yearly_cents=d["price_yearly_cents"],
+            )
+            session.add(tier)
+            session.flush()
+            for fk in d["features"]:
+                session.add(TierFeature(tier_id=tier.id, feature_key=fk, enabled=True))
+        session.commit()
+        _log.info("Seeded 3 default tiers")
+    except Exception:
+        _log.exception("Tier seeding failed (non-fatal)")
+        session.rollback()
+    finally:
+        session.close()
+
+
+_seed_default_tiers()
+
+
+def _seed_super_admin() -> None:
+    """Ensure the hardcoded super-admin account exists with the correct role."""
+    import bcrypt as _bcrypt
+    from database import SessionLocal
+    from models.user import User
+    SUPER_EMAIL = "gary.s.schwartz617@gmail.com"
+    SUPER_PASS  = "Desk1234"
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(email=SUPER_EMAIL).first()
+        if user:
+            user.role = "super_admin"
+            if not user.password_hash:
+                user.password_hash = _bcrypt.hashpw(SUPER_PASS.encode(), _bcrypt.gensalt()).decode()
+        else:
+            user = User(
+                email=SUPER_EMAIL,
+                name="Gary",
+                role="super_admin",
+                password_hash=_bcrypt.hashpw(SUPER_PASS.encode(), _bcrypt.gensalt()).decode(),
+            )
+            session.add(user)
+        session.commit()
+        _log.info("Super-admin account ready: %s", SUPER_EMAIL)
+    except Exception:
+        _log.exception("Super-admin seed failed (non-fatal)")
+        session.rollback()
+    finally:
+        session.close()
+
+
+_seed_super_admin()
 
 # Start the 12-hour background scheduler.
 # Called here (module level) so it runs under gunicorn too, not just `python app.py`.
@@ -364,7 +465,7 @@ def backfill_article4():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, threaded=True)
+    app.run(debug=True, threaded=True, port=5001)
 # if __name__ == "__main__":
 #     init_db()
 

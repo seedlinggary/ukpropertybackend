@@ -19,6 +19,7 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
 from database import engine
+from middleware.tracking import track_feature
 
 logger = logging.getLogger(__name__)
 intelligence_bp = Blueprint("intelligence", __name__)
@@ -439,6 +440,7 @@ def _extract_officer_id(officer: dict) -> str:
 # ---------------------------------------------------------------------------
 
 @intelligence_bp.route("/api/ownership/intelligence/person/<officer_id>")
+@track_feature("intelligence_profile", action="person")
 def person_intelligence(officer_id: str):
     """
     Aggregate person-level ownership intelligence from CH appointments and HMLR titles.
@@ -668,6 +670,7 @@ def person_intelligence(officer_id: str):
 # ---------------------------------------------------------------------------
 
 @intelligence_bp.route("/api/ownership/intelligence/company/<company_number>")
+@track_feature("intelligence_profile", action="company")
 def company_intelligence(company_number: str):
     """
     Aggregate company-level ownership intelligence from CH profile, charges, officers

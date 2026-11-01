@@ -756,6 +756,123 @@ def _fetch_planning(lat: float, lng: float) -> dict:
         return dict(pool.map(_one, datasets.items()))
 
 
+def _fetch_heritage(lat: float, lng: float) -> dict:
+    """
+    Checks whether the property is a designated heritage asset and finds
+    nearby assets within ~200m.
+
+    Sources:
+      1. planning.data.gov.uk — listed-building (with grade I/II*/II),
+         scheduled-monument, conservation-area, park-and-garden,
+         world-heritage-site at a tight 30m radius so we only flag the
+         property itself, not its neighbours.
+      2. Historic England NHLE GeoSearch — all asset types within 0.2 km.
+    """
+    heritage_datasets = [
+        ("listed_building",       "listed-building"),
+        ("scheduled_monument",    "scheduled-monument"),
+        ("conservation_area",     "conservation-area"),
+        ("registered_park_garden","park-and-garden"),
+        ("world_heritage_site",   "world-heritage-site"),
+    ]
+
+    def _fetch_dataset(pair):
+        key, dataset = pair
+        try:
+            r = requests.get(
+                "https://www.planning.data.gov.uk/entity.json",
+                params={"latitude": lat, "longitude": lng, "dataset": dataset,
+                        "limit": 5, "radius": 30},
+                headers={"Accept": "application/json"},
+                timeout=TIMEOUT,
+            )
+            return key, (r.json() or {}).get("entities", []) if r.ok else []
+        except Exception:
+            return key, []
+
+    with ThreadPoolExecutor(max_workers=len(heritage_datasets)) as pool:
+        dataset_results = dict(pool.map(_fetch_dataset, heritage_datasets))
+
+    result: dict = {
+        "listed_building":        None,
+        "scheduled_monument":     False,
+        "conservation_area":      False,
+        "registered_park_garden": False,
+        "world_heritage_site":    False,
+        "nearby":                 [],
+    }
+
+    lb_entities = dataset_results.get("listed_building", [])
+    if lb_entities:
+        e = lb_entities[0]
+        raw_grade = (
+            e.get("grade") or e.get("listing-grade") or
+            (e.get("entity_data") or {}).get("grade") or ""
+        )
+        # Normalise: "Grade II" → "II", "grade-ii-star" → "II*" etc.
+        g = raw_grade.strip()
+        if g.lower() in ("grade-i", "grade i", "i"):
+            g = "I"
+        elif g.lower() in ("grade-ii*", "grade ii*", "ii*", "grade-ii-star", "grade ii star"):
+            g = "II*"
+        elif g.lower() in ("grade-ii", "grade ii", "ii"):
+            g = "II"
+        result["listed_building"] = {
+            "found": True,
+            "grade": g or raw_grade,
+            "name": e.get("name") or "",
+            "reference": e.get("reference") or "",
+        }
+
+    for key in ("scheduled_monument", "conservation_area", "registered_park_garden", "world_heritage_site"):
+        entities = dataset_results.get(key, [])
+        result[key] = bool(entities)
+        if entities:
+            result[f"{key}_names"] = [e.get("name") or e.get("reference", "") for e in entities[:3]]
+
+    # Historic England NHLE GeoSearch — nearby assets within 200m
+    try:
+        nhle = requests.get(
+            "https://services.historicengland.org.uk/NMRGeoSearch/NMRGeoSearchService.asmx/SearchByRadius",
+            params={
+                "lat": lat, "lng": lng, "Radius": 0.2,
+                "CombinedResultsPerPage": 20,
+                "MapType": "GeoSearch",
+                "format": "JSON",
+            },
+            timeout=TIMEOUT,
+        )
+        if nhle.ok:
+            body = nhle.json()
+            # Response shape varies; try common keys
+            items = (
+                body.get("Results", {}).get("Result") or
+                body.get("results", []) or
+                []
+            )
+            if isinstance(items, dict):
+                items = [items]
+            nearby = []
+            for item in items[:15]:
+                dist_raw = item.get("DistanceFromSearch") or item.get("Distance") or 0
+                try:
+                    dist_m = round(float(dist_raw) * 1609.34)
+                except (TypeError, ValueError):
+                    dist_m = None
+                nearby.append({
+                    "name":       item.get("Name") or item.get("name") or "",
+                    "grade":      item.get("Grade") or item.get("grade") or "",
+                    "type":       item.get("RecordType") or item.get("type") or "",
+                    "list_entry": item.get("ListEntry") or item.get("listEntry") or "",
+                    "distance_m": dist_m,
+                })
+            result["nearby"] = [n for n in nearby if n["name"]]
+    except Exception:
+        pass
+
+    return result
+
+
 def _fetch_flood(lat: float, lng: float) -> dict:
     try:
         r = requests.get(
@@ -980,11 +1097,12 @@ def get_property_data():
 
     no_pc = {"found": False, "error": "Could not determine postcode"}
 
-    with ThreadPoolExecutor(max_workers=9) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         f_planning    = pool.submit(_fetch_planning, lat, lng)
         f_flood       = pool.submit(_fetch_flood, lat, lng)
         f_crime       = pool.submit(_fetch_crime, lat, lng)
         f_nearby      = pool.submit(_fetch_nearby, lat, lng)
+        f_heritage    = pool.submit(_fetch_heritage, lat, lng)
         f_epc         = pool.submit(_fetch_epc, epc_postcode, address_hint) if epc_postcode else None
         f_sales       = pool.submit(_fetch_sales, postcode)       if postcode else None
         f_council_tax = pool.submit(_fetch_council_tax, postcode) if postcode else None
@@ -1060,6 +1178,7 @@ def get_property_data():
             "crime":       crime_result,
             "nearby":      safe(f_nearby,      "nearby"),
             "council_tax": safe(f_council_tax, "ctax")     if f_council_tax else {"found": False},
+            "heritage":    safe(f_heritage,    "heritage"),
         }
 
         # Store in cache; evict oldest 20 entries when cap exceeded

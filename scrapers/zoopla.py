@@ -70,7 +70,7 @@ _CURL_HEADERS = {
     "accept-language": "en-GB,en;q=0.9",
     "cache-control": "no-cache",
     "pragma": "no-cache",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not-A.Brand";v="24"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "document",
@@ -134,7 +134,7 @@ def _direct_curl(url: str) -> Optional[str]:
         resp = cffi_req.get(
             url,
             headers=_CURL_HEADERS,
-            impersonate="chrome124",
+            impersonate="chrome131",
             timeout=30,
             allow_redirects=True,
         )
@@ -229,9 +229,19 @@ def _schema_items_from_html(html: str) -> List[dict]:
 
     All three embed the same @graph structure with a SearchResultsPage node.
     """
-    def _items_from_graph(data: dict) -> List[dict]:
-        for node in data.get("@graph", []):
-            if node.get("@type") == "SearchResultsPage":
+    def _items_from_graph(data) -> List[dict]:
+        # JSON-LD can be a dict with @graph, a bare list of nodes, or a flat object
+        if isinstance(data, list):
+            nodes = data
+        elif isinstance(data, dict):
+            nodes = data.get("@graph", [])
+            # Flat root-level SearchResultsPage (no @graph wrapper)
+            if not nodes and data.get("@type") == "SearchResultsPage":
+                nodes = [data]
+        else:
+            return []
+        for node in nodes:
+            if isinstance(node, dict) and node.get("@type") == "SearchResultsPage":
                 elements = node.get("mainEntity", {}).get("itemListElement", [])
                 return [el["item"] for el in elements if el.get("item")]
         return []

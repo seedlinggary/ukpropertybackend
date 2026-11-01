@@ -53,6 +53,16 @@ def _scheduled_auction_scrape() -> None:
         logger.exception("[scheduler] Auction scrape failed")
 
 
+def _scheduled_daily_digest() -> None:
+    """Send personalised property match emails to opted-in users."""
+    logger.info("[scheduler] Triggered daily match digest")
+    try:
+        from services.email_notifier import send_daily_match_emails
+        send_daily_match_emails()
+    except Exception:
+        logger.exception("[scheduler] Daily digest failed")
+
+
 def _scheduled_hmlr_refresh() -> None:
     """Monthly: download latest CCOD/OCOD from HMLR then import into DB."""
     import os
@@ -69,6 +79,11 @@ def _scheduled_hmlr_refresh() -> None:
 
 
 def start_scheduler() -> None:
+    import os
+    if not os.getenv("RUN_SCHEDULER"):
+        logger.info("[scheduler] Skipped — set RUN_SCHEDULER=1 in environment to enable scraping")
+        return
+
     if _scheduler.running:
         return
 
@@ -101,6 +116,15 @@ def start_scheduler() -> None:
         id="hmlr_monthly_refresh",
         replace_existing=True,
     )
+
+    # Daily match digest — DISABLED until ready to send real emails.
+    # Uncomment the block below and set RESEND_API_KEY in .env to activate.
+    # _scheduler.add_job(
+    #     func=_scheduled_daily_digest,
+    #     trigger=IntervalTrigger(hours=24),
+    #     id="daily_match_digest",
+    #     replace_existing=True,
+    # )
 
     _scheduler.start()
     logger.info("[scheduler] Started — Zoopla every 24h; Auctions every 72h; HMLR every 30 days")

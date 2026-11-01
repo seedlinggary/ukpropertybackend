@@ -25,6 +25,8 @@ from routes.property_data import (
     _fetch_epc, _fetch_epc_detail,
 )
 
+from middleware.tracking import track_feature
+
 logger = logging.getLogger(__name__)
 postcode_analysis_bp = Blueprint("postcode_analysis", __name__)
 
@@ -266,6 +268,7 @@ def _sse(data: dict) -> str:
 # ── Main endpoint: LR + EPC for in-postcode + ownership → JSON ───────────────
 
 @postcode_analysis_bp.route("/api/postcode-analysis")
+@track_feature("postcode_analysis", action="view")
 def get_postcode_analysis():
     postcode = _fmt(request.args.get("postcode", ""))
     if not postcode:

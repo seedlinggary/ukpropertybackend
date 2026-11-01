@@ -31,7 +31,7 @@ CURL_HEADERS = {
     "accept-language": "en-GB,en;q=0.9",
     "cache-control": "no-cache",
     "pragma": "no-cache",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua": '"Chromium";v="131", "Google Chrome";v="131", "Not-A.Brand";v="24"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "document",
@@ -196,7 +196,7 @@ def direct_curl(url: str, source: str = "scraper") -> Optional[str]:
     try:
         from curl_cffi import requests as cffi_req
         resp = cffi_req.get(
-            url, headers=CURL_HEADERS, impersonate="chrome124",
+            url, headers=CURL_HEADERS, impersonate="chrome131",
             timeout=30, allow_redirects=True,
         )
         if resp.status_code != 200:

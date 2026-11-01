@@ -22,6 +22,7 @@ from flask import Blueprint, request, jsonify
 import requests as _req
 from .idox_scraper import find_council_portal, idox_search, IDOX_PORTALS
 from . import pins_loader
+from middleware.tracking import track_feature
 
 log = logging.getLogger(__name__)
 
@@ -469,6 +470,7 @@ def _score(result: dict, change_type: str) -> int:
 
 
 @planning_bp.route("/api/planning/search")
+@track_feature("planning_search", action="search")
 def planning_search():
     postcode    = request.args.get("postcode", "").strip()
     change_type = request.args.get("change_type", "any").strip()

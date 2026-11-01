@@ -5,6 +5,7 @@ from sqlalchemy import or_, text
 from sqlalchemy.exc import OperationalError
 from database import SessionLocal
 from models.property_listing import PropertyListing
+from middleware.tracking import track_feature
 
 properties_bp = Blueprint("properties", __name__)
 
@@ -59,6 +60,7 @@ def _keyword_filter(q, text: str):
 
 
 @properties_bp.route("/properties", methods=["GET"])
+@track_feature("properties_search", action="search")
 def list_properties():
     page  = max(1, request.args.get("page",  1,    type=int))
     limit = min(100, max(1, request.args.get("limit", 20, type=int)))

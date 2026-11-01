@@ -3,6 +3,7 @@ import logging
 import os
 
 from flask import Blueprint, jsonify, request
+from middleware.tracking import track_feature
 
 ai_search_bp = Blueprint("ai_search", __name__)
 log = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ _ALLOWED = frozenset({
 
 
 @ai_search_bp.route("/api/ai-search", methods=["POST"])
+@track_feature("ai_search", action="query")
 def ai_search():
     data = request.get_json(silent=True) or {}
     query = str(data.get("query", "")).strip()[:500]

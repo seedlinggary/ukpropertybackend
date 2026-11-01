@@ -22,6 +22,7 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from database import engine
+from middleware.tracking import track_feature
 
 logger = logging.getLogger(__name__)
 ownership_bp = Blueprint("ownership", __name__)
@@ -116,6 +117,7 @@ def _ensure_table():
 
 @ownership_bp.route("/api/ownership/search")
 @_db_retry()
+@track_feature("ownership_search", action="search")
 def search_ownership():
     _ensure_table()
     q    = request.args.get("q", "").strip()
@@ -212,6 +214,7 @@ def search_ownership():
 
 @ownership_bp.route("/api/ownership/titles")
 @_db_retry()
+@track_feature("ownership_search", action="titles")
 def get_titles():
     _ensure_table()
     reg  = request.args.get("reg",  "").strip()

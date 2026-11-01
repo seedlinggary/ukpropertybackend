@@ -154,7 +154,7 @@ def main():
 
             # ── Tier 1: curl ──────────────────────────────────────────
             print("  Trying curl_cffi (Chrome TLS impersonation)…")
-            html = _z._curl_get(url)
+            html = _z._direct_curl(url)
 
             if html:
                 _diag_curl(html, page)
@@ -185,7 +185,7 @@ def main():
                     break
 
                 items = _z._dom_schema_items(uc_driver)
-                has_next = _z._dom_has_next_page(uc_driver)
+                has_next = _z._html_has_next_page(uc_driver.page_source, page)
                 print(f"  {'✅' if items else '❌'} browser extracted {len(items)} items")
 
             # ── Normalise ─────────────────────────────────────────────
