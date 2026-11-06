@@ -20,6 +20,7 @@ from sqlalchemy import text
 
 from database import engine
 from middleware.tracking import track_feature
+from middleware.auth import require_auth
 
 logger = logging.getLogger(__name__)
 intelligence_bp = Blueprint("intelligence", __name__)
@@ -440,6 +441,7 @@ def _extract_officer_id(officer: dict) -> str:
 # ---------------------------------------------------------------------------
 
 @intelligence_bp.route("/api/ownership/intelligence/person/<officer_id>")
+@require_auth(feature="intelligence_profile")
 @track_feature("intelligence_profile", action="person")
 def person_intelligence(officer_id: str):
     """
@@ -670,6 +672,7 @@ def person_intelligence(officer_id: str):
 # ---------------------------------------------------------------------------
 
 @intelligence_bp.route("/api/ownership/intelligence/company/<company_number>")
+@require_auth(feature="intelligence_profile")
 @track_feature("intelligence_profile", action="company")
 def company_intelligence(company_number: str):
     """
@@ -1121,6 +1124,7 @@ def _fetch_lr_price_one(pc: str) -> tuple:
 
 
 @intelligence_bp.route("/api/ownership/intelligence/postcode-prices")
+@require_auth(feature="intelligence_profile")
 def postcode_prices():
     """
     Batch-fetch most recent sale price for up to 100 postcodes.

@@ -20,10 +20,18 @@ from flask import Blueprint, Response, jsonify, request, stream_with_context
 import requests
 from sqlalchemy import text
 from database import engine
+
+try:
+    from curl_cffi import requests as _cffi_requests
+    from bs4 import BeautifulSoup as _BeautifulSoup
+    _RM_AVAILABLE = True
+except ImportError:
+    _RM_AVAILABLE = False
 from routes.property_data import (
-    _lr_val, _parse_lr_date, _PROP_TYPE, _TENURE, TIMEOUT,
+    _parse_lr_date, _PROP_TYPE, _TENURE,
     _fetch_epc, _fetch_epc_detail,
 )
+from middleware.auth import require_auth
 
 from middleware.tracking import track_feature
 
@@ -68,72 +76,139 @@ def _geocode(postcode: str) -> tuple:
     return None, None
 
 
-_LR_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+_RM_TYPE_MAP = {
+    "flat": "F", "apartment": "F", "maisonette": "F",
+    "detached": "D", "semi-detached": "S",
+    "terraced": "T", "bungalow": "D",
 }
+_RM_FLAT_PREFIX = re.compile(
+    r'^(flat|apartment|apt|unit|floor|suite|room)\s+\S+[,\s]+', re.IGNORECASE
+)
+_RM_TYPE_RE   = re.compile(
+    r'(?<![A-Za-z])(flat|detached|semi-detached|terraced|maisonette|apartment|bungalow)',
+    re.IGNORECASE,
+)
+_RM_TENURE_RE = re.compile(r'(?<![A-Za-z])(leasehold|freehold)', re.IGNORECASE)
+_RM_PC_RE     = re.compile(r'[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}', re.IGNORECASE)
+_RM_TOWNS     = {"london", "england", "wales", "scotland", "ireland"}
 
 
-def _fetch_lr_sales(postcode: str) -> list:
-    all_items: list = []
-    for page in range(3):
-        try:
-            r = requests.get(
-                "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
-                params={
-                    "propertyAddress.postcode": postcode,
-                    "_pageSize": 100,
-                    "_sort": "-transactionDate",
-                    "_page": page,
-                },
-                headers=_LR_HEADERS,
-                timeout=TIMEOUT,
-            )
-            if not r.ok:
-                logger.warning("[postcode_analysis] LR HTTP %d for postcode %s — body: %.200s",
-                               r.status_code, postcode, r.text)
-                break
-            items = (r.json() or {}).get("result", {}).get("items", [])
-            all_items.extend(items)
-            if len(items) < 100:
-                break
-        except Exception as exc:
-            logger.warning("[postcode_analysis] LR page %d error: %s", page, exc)
-            break
-    return all_items
+def _fetch_rm_sold(postcode: str) -> tuple:
+    """
+    Fetch sold prices from Rightmove for the given postcode.
+    Returns (prop_sales, main_street) where prop_sales is {(paon,saon): [sale_dicts]}.
+    HMLR LDP API was decommissioned (403); Rightmove is the replacement source.
+    """
+    if not _RM_AVAILABLE:
+        logger.error("[postcode_analysis] curl_cffi / bs4 not installed — cannot fetch sold prices")
+        return {}, ""
 
+    slug = postcode.replace(" ", "").lower()
+    try:
+        resp = _cffi_requests.get(
+            f"https://www.rightmove.co.uk/house-prices/{slug}.html",
+            impersonate="chrome110",
+            timeout=15,
+        )
+    except Exception as exc:
+        logger.warning("[postcode_analysis] Rightmove fetch error for %s: %s", postcode, exc)
+        return {}, ""
 
-def _fetch_lr_sales_by_street(street: str, town: str) -> list:
-    all_items: list = []
-    for page in range(3):
-        try:
-            r = requests.get(
-                "https://landregistry.data.gov.uk/data/ppi/transaction-record.json",
-                params={
-                    "propertyAddress.street": street,
-                    "propertyAddress.town": town,
-                    "_pageSize": 100,
-                    "_sort": "-transactionDate",
-                    "_page": page,
-                },
-                headers=_LR_HEADERS,
-                timeout=TIMEOUT,
-            )
-            if not r.ok:
-                logger.warning("[postcode_analysis] LR street HTTP %d — %s/%s", r.status_code, street, town)
+    if resp.status_code != 200:
+        logger.warning("[postcode_analysis] Rightmove HTTP %d for %s", resp.status_code, postcode)
+        return {}, ""
+
+    soup = _BeautifulSoup(resp.content, "lxml")
+    trans_tables = soup.find_all(class_=re.compile(r'_transactionProviderTable_'))
+    if not trans_tables:
+        logger.info("[postcode_analysis] Rightmove: no sold data for %s", postcode)
+        return {}, ""
+
+    prop_sales: dict = defaultdict(list)
+    streets: list = []
+
+    for tt in trans_tables:
+        # Find address in nearest DOM ancestor
+        address_text = None
+        node = tt.parent
+        for _ in range(6):
+            if node is None:
                 break
-            items = (r.json() or {}).get("result", {}).get("items", [])
-            all_items.extend(items)
-            if len(items) < 100:
+            for el in node.find_all(["h2", "h3", "h4", "span", "p", "a"], recursive=False):
+                txt = el.get_text(strip=True)
+                if _RM_PC_RE.search(txt) and len(txt) > 8:
+                    address_text = txt
+                    break
+            if address_text:
                 break
-        except Exception as exc:
-            logger.warning("[postcode_analysis] street LR page %d error: %s", page, exc)
-            break
-    return all_items
+            node = node.parent
+
+        if not address_text:
+            continue
+
+        # Clean address at postcode boundary
+        pc_m = _RM_PC_RE.search(address_text)
+        clean_address = address_text[:pc_m.end()].strip() if pc_m else address_text
+
+        # Extract type and tenure (may be concatenated after postcode: "LeaseholdPrevious")
+        type_m   = _RM_TYPE_RE.search(address_text)
+        tenure_m = _RM_TENURE_RE.search(address_text)
+        raw_type       = _RM_TYPE_MAP.get(type_m.group(1).lower() if type_m else "", "")
+        raw_tenure_key = tenure_m.group(1)[0].upper() if tenure_m else ""
+        prop_type  = _PROP_TYPE.get(raw_type, "")
+        tenure_str = _TENURE.get(raw_tenure_key, tenure_m.group(1).capitalize() if tenure_m else "")
+
+        # Parse address into parts
+        parts = [p.strip() for p in clean_address.split(",")]
+        parts = [
+            p for p in parts
+            if p and not re.match(r'^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$', p.strip(), re.I)
+        ]
+
+        if _RM_FLAT_PREFIX.match(clean_address):
+            saon   = parts[0].upper() if len(parts) > 0 else ""
+            paon   = parts[1].upper() if len(parts) > 1 else ""
+            street = parts[2].upper() if len(parts) > 2 else ""
+        else:
+            saon   = ""
+            paon   = parts[0].upper() if len(parts) > 0 else ""
+            street = parts[1].upper() if len(parts) > 1 else ""
+
+        if street.lower() in _RM_TOWNS:
+            street = ""
+        if street:
+            streets.append(street)
+
+        display_address = ", ".join(p for p in [saon, paon, street] if p)
+
+        # Extract sale rows
+        for row in tt.find_all(class_=re.compile(r'_transactionTableRow_')):
+            cells = row.find_all(class_=re.compile(r'_transactionTableCell_'))
+            if len(cells) < 2:
+                continue
+            date_raw    = cells[0].get_text(strip=True)
+            price_raw   = cells[1].get_text(strip=True)
+            if not re.search(r'\d{4}', date_raw):
+                continue
+            price_clean = re.sub(r'[^0-9]', '', price_raw)
+            if not price_clean:
+                continue
+            prop_sales[(paon, saon)].append({
+                "price":     int(price_clean),
+                "date":      _parse_lr_date(date_raw),
+                "type":      prop_type,
+                "tenure":    tenure_str,
+                "new_build": None,
+                "address":   display_address,
+                "paon":      paon,
+                "saon":      saon,
+                "street":    street,
+                "postcode":  postcode,
+                "category":  "Standard",
+            })
+
+    main_street = Counter(streets).most_common(1)[0][0] if streets else ""
+    return dict(prop_sales), main_street
 
 
 def _fetch_ownership(postcode: str) -> list:
@@ -175,90 +250,10 @@ def _fetch_ownership(postcode: str) -> list:
 
 def _build_prop_sales(postcode: str) -> tuple:
     """
-    Fetch and parse LR data for postcode + street expansion.
+    Fetch and parse sold price data for postcode.
     Returns (prop_sales, main_street) where prop_sales is {(paon,saon): [sale_dicts]}.
     """
-    lr_postcode_items = _fetch_lr_sales(postcode)
-    if not lr_postcode_items:
-        return {}, ""
-
-    _sc: Counter = Counter()
-    _tc: Counter = Counter()
-    for _item in lr_postcode_items:
-        _addr = _item.get("propertyAddress") or {}
-        _sv = str(_lr_val(_addr.get("street")) or "").strip().upper()
-        _tv = str(_lr_val(_addr.get("town"))   or "").strip().upper()
-        if _sv: _sc[_sv] += 1
-        if _tv: _tc[_tv] += 1
-    main_street = _sc.most_common(1)[0][0] if _sc else ""
-    main_town   = _tc.most_common(1)[0][0] if _tc else ""
-
-    lr_street_items = (
-        _fetch_lr_sales_by_street(main_street, main_town)
-        if main_street and main_town else []
-    )
-
-    # Limit street expansion to the same postcode district (e.g. "PL4") so we
-    # don't pull in properties from neighbouring districts on the same street name.
-    _target_district = re.match(
-        r"^([A-Z]{1,2}\d{1,2}[A-Z]?)",
-        re.sub(r"\s+", "", postcode.upper()),
-    )
-    _target_district = _target_district.group(1) if _target_district else ""
-
-    def _item_district(item: dict) -> str:
-        pc = str(
-            _lr_val((item.get("propertyAddress") or {}).get("postcode")) or ""
-        ).replace(" ", "").upper()
-        m = re.match(r"^([A-Z]{1,2}\d{1,2}[A-Z]?)", pc)
-        return m.group(1) if m else ""
-
-    if _target_district:
-        lr_street_items = [
-            item for item in lr_street_items
-            if _item_district(item) == _target_district
-        ]
-
-    seen_txids: set = {item.get("transactionId", "") for item in lr_postcode_items}
-    lr_items = lr_postcode_items + [
-        item for item in lr_street_items
-        if item.get("transactionId", "") not in seen_txids
-    ]
-
-    def _s(v):
-        return _lr_val(v) if isinstance(v, dict) else v
-
-    raw_sales: list = []
-    for item in lr_items:
-        addr       = item.get("propertyAddress") or {}
-        paon       = str(_s(addr.get("paon"))     or "")
-        saon       = str(_s(addr.get("saon"))     or "")
-        street_n   = str(_s(addr.get("street"))   or "")
-        town_n     = str(_s(addr.get("town"))     or "")
-        pc         = str(_s(addr.get("postcode")) or postcode)
-        raw_type   = str(_lr_val(item.get("propertyType")) or "")
-        raw_tenure = str(_lr_val(item.get("estateType"))   or "")
-        raw_cat    = str(_lr_val(item.get("transactionCategory")) or "")
-        parts      = [p for p in [saon, paon, street_n, town_n] if p]
-        raw_sales.append({
-            "price":     _s(item.get("pricePaid")),
-            "date":      _parse_lr_date(str(item.get("transactionDate") or "")),
-            "type":      _PROP_TYPE.get(raw_type, raw_type.title() if raw_type else ""),
-            "tenure":    _TENURE.get(raw_tenure, raw_tenure.title() if raw_tenure else ""),
-            "new_build": _s(item.get("newBuild")),
-            "address":   ", ".join(parts),
-            "paon":      paon,
-            "saon":      saon,
-            "street":    street_n,
-            "postcode":  pc,
-            "category":  "Additional" if "additional" in raw_cat.lower() else "Standard",
-        })
-
-    prop_sales: dict = defaultdict(list)
-    for sale in raw_sales:
-        prop_sales[(sale["paon"], sale["saon"])].append(sale)
-
-    return dict(prop_sales), main_street
+    return _fetch_rm_sold(postcode)
 
 
 def _sse(data: dict) -> str:
@@ -268,6 +263,7 @@ def _sse(data: dict) -> str:
 # ── Main endpoint: LR + EPC for in-postcode + ownership → JSON ───────────────
 
 @postcode_analysis_bp.route("/api/postcode-analysis")
+@require_auth(feature="postcode_analysis")
 @track_feature("postcode_analysis", action="view")
 def get_postcode_analysis():
     postcode = _fmt(request.args.get("postcode", ""))
@@ -458,6 +454,7 @@ def get_postcode_analysis():
 # ── EPC stream: user-triggered, all properties via SSE ───────────────────────
 
 @postcode_analysis_bp.route("/api/postcode-analysis/epc-stream")
+@require_auth(feature="postcode_analysis")
 def get_epc_stream():
     postcode = _fmt(request.args.get("postcode", ""))
     if not postcode:

@@ -23,6 +23,7 @@ import requests as _req
 from .idox_scraper import find_council_portal, idox_search, IDOX_PORTALS
 from . import pins_loader
 from middleware.tracking import track_feature
+from middleware.auth import require_auth
 
 log = logging.getLogger(__name__)
 
@@ -470,6 +471,7 @@ def _score(result: dict, change_type: str) -> int:
 
 
 @planning_bp.route("/api/planning/search")
+@require_auth(feature="planning_search")
 @track_feature("planning_search", action="search")
 def planning_search():
     postcode    = request.args.get("postcode", "").strip()
@@ -620,6 +622,7 @@ def planning_search():
 
 
 @planning_bp.route("/api/planning/pins-status")
+@require_auth(feature="planning_search")
 def pins_status():
     """Diagnostic: confirm PINS loader state in this worker process."""
     ready = pins_loader.is_ready()
@@ -678,6 +681,7 @@ TPO_LPAS = [
 
 
 @planning_bp.route("/api/planning/coverage")
+@require_auth(feature="planning_search")
 def planning_coverage():
     """Returns structured coverage data for the frontend coverage panel."""
     idox_council_list = sorted(IDOX_PORTALS.keys())
@@ -783,6 +787,7 @@ def _fetch_context_count(database: str, org_entity: int) -> int:
 
 
 @planning_bp.route("/api/planning/context")
+@require_auth(feature="planning_search")
 def planning_context():
     """
     Planning constraint context for a postcode's LPA.

@@ -89,13 +89,18 @@ def _get_bearer() -> str | None:
     return None
 
 
-def require_auth(roles: list[str] | None = None, permissions: list[str] | None = None):
+def require_auth(
+    roles: list[str] | None = None,
+    permissions: list[str] | None = None,
+    feature: str | None = None,
+):
     """
     Decorator factory.
 
-    @require_auth()                        — any authenticated user
+    @require_auth()                                   — any authenticated user
     @require_auth(roles=["admin","super_admin"])
     @require_auth(permissions=["view_login_stats"])
+    @require_auth(feature="postcode_analysis")        — user's tier must include feature
     """
     def decorator(fn):
         @wraps(fn)
@@ -131,6 +136,20 @@ def require_auth(roles: list[str] | None = None, permissions: list[str] | None =
                     else:
                         return jsonify({"error": "Insufficient permissions"}), 403
 
+                if feature and user.role != "super_admin":
+                    from models.tier import TierFeature
+                    has_feat = (
+                        session.query(TierFeature)
+                        .filter_by(tier_id=user.tier_id, feature_key=feature, enabled=True)
+                        .first()
+                    ) is not None if user.tier_id else False
+                    if not has_feat:
+                        return jsonify({
+                            "error": "Feature not available on your current plan",
+                            "feature": feature,
+                            "upgrade_required": True,
+                        }), 403
+
                 g.current_user = user
                 g.db_session = session
                 return fn(*args, **kwargs)
@@ -139,7 +158,6 @@ def require_auth(roles: list[str] | None = None, permissions: list[str] | None =
                 session.close()
                 return jsonify({"error": "Internal server error"}), 500
             finally:
-                # Only close if not already done inside the route (caller must close g.db_session)
                 pass
         return wrapper
     return decorator

@@ -846,6 +846,7 @@ class ZooplaScraper(BaseScraper):
         results: List[Dict[str, Any]] = []
         uc_driver  = None
         stop_city  = False
+        _prefer_scraper_api = False  # skip browser once ScraperAPI proves it works
 
         try:
             page = 1
@@ -858,31 +859,35 @@ class ZooplaScraper(BaseScraper):
                 used_browser = False
 
                 # ── Tier 1: direct curl (free) ────────────────────
-                # ── Tier 1: direct curl (free) ────────────────────
-                html = _direct_curl(url)
-                _track("search", "curl", bool(html))
-                if html:
-                    raw_items = _schema_items_from_html(html)
-                    if raw_items:
-                        logger.info("[zoopla/curl] %d items on page %d", len(raw_items), page)
-                        has_next = _html_has_next_page(html, page)
+                if not _prefer_scraper_api:
+                    html = _direct_curl(url)
+                    _track("search", "curl", bool(html))
+                    if html:
+                        raw_items = _schema_items_from_html(html)
+                        if raw_items:
+                            logger.info("[zoopla/curl] %d items on page %d", len(raw_items), page)
+                            has_next = _html_has_next_page(html, page)
 
                 # ── Tier 2: UC browser (free) ─────────────────────
-                if not raw_items:
+                if not raw_items and not _prefer_scraper_api:
                     used_browser = True
-                    if uc_driver is None:
-                        uc_driver = _make_uc_driver(headless=_UC_HEADLESS)
+                    try:
+                        if uc_driver is None:
+                            uc_driver = _make_uc_driver(headless=_UC_HEADLESS)
 
-                    uc_driver.get(url)
-                    time.sleep(random.uniform(4.0, 6.0))
-                    if _wait_for_cloudflare(uc_driver):
-                        if page == 1:
-                            _browser_set_sort(uc_driver, SORT_PARAM)
-                        raw_items = _dom_schema_items(uc_driver)
-                        has_next = _html_has_next_page(uc_driver.page_source, page)
-                        logger.info("[zoopla/browser] %d items on page %d", len(raw_items), page)
-                    else:
-                        logger.warning("[zoopla/browser] CF not resolved on page %d — trying ScraperAPI", page)
+                        uc_driver.get(url)
+                        time.sleep(random.uniform(4.0, 6.0))
+                        if _wait_for_cloudflare(uc_driver):
+                            if page == 1:
+                                _browser_set_sort(uc_driver, SORT_PARAM)
+                            raw_items = _dom_schema_items(uc_driver)
+                            has_next = _html_has_next_page(uc_driver.page_source, page)
+                            logger.info("[zoopla/browser] %d items on page %d", len(raw_items), page)
+                        else:
+                            logger.warning("[zoopla/browser] CF not resolved on page %d — trying ScraperAPI", page)
+                    except Exception as _browser_err:
+                        logger.warning("[zoopla/browser] driver error on page %d: %s", page, _browser_err)
+                        uc_driver = None  # discard crashed driver
                     _track("search", "browser", bool(raw_items))
 
                 # ── Tier 3: ScraperAPI datacenter (1 credit) ──────
@@ -895,6 +900,7 @@ class ZooplaScraper(BaseScraper):
                         if raw_items:
                             has_next = _html_has_next_page(html, page)
                             logger.info("[zoopla/scraperapi-dc] %d items on page %d", len(raw_items), page)
+                            _prefer_scraper_api = True  # skip browser for remaining pages
 
                 # ── Tier 4: ScraperAPI residential (5 credits) ────
                 if not raw_items and api_key and _SCRAPERAPI_RESIDENTIAL:

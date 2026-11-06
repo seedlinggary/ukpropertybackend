@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from flask import Blueprint, jsonify, request
 import requests
+from middleware.auth import require_auth
 
 try:
     from bs4 import BeautifulSoup as _BS
@@ -1042,6 +1043,7 @@ def _fetch_nearby(lat: float, lng: float) -> dict:
 
 
 @property_data_bp.route("/api/epc-detail")
+@require_auth(feature="properties_search")
 def get_epc_detail():
     cert = request.args.get("cert", "").strip()
     if not cert:
@@ -1050,6 +1052,7 @@ def get_epc_detail():
 
 
 @property_data_bp.route("/api/property-data")
+@require_auth(feature="properties_search")
 def get_property_data():
     try:
         lat = float(request.args["lat"])
@@ -1495,6 +1498,7 @@ def _street_from_postcode(postcode: str) -> tuple:
 
 
 @property_data_bp.route("/api/street-sales")
+@require_auth(feature="properties_search")
 def get_street_sales():
     """
     GET /api/street-sales?address=<full_address>&postcode=<postcode>

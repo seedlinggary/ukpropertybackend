@@ -6,6 +6,7 @@ from sqlalchemy.exc import OperationalError
 from database import SessionLocal
 from models.property_listing import PropertyListing
 from middleware.tracking import track_feature
+from middleware.auth import require_auth
 
 properties_bp = Blueprint("properties", __name__)
 
@@ -60,6 +61,7 @@ def _keyword_filter(q, text: str):
 
 
 @properties_bp.route("/properties", methods=["GET"])
+@require_auth(feature="properties_search")
 @track_feature("properties_search", action="search")
 def list_properties():
     page  = max(1, request.args.get("page",  1,    type=int))
@@ -203,6 +205,7 @@ def list_properties():
 
 
 @properties_bp.route("/properties/<property_id>", methods=["GET"])
+@require_auth(feature="properties_search")
 def get_property(property_id: str):
     for attempt in range(3):
         if attempt > 0:

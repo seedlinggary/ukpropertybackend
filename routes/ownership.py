@@ -22,6 +22,7 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from database import engine
+from middleware.auth import require_auth
 from middleware.tracking import track_feature
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ def _ensure_table():
 # ---------------------------------------------------------------------------
 
 @ownership_bp.route("/api/ownership/search")
+@require_auth(feature="ownership_search")
 @_db_retry()
 @track_feature("ownership_search", action="search")
 def search_ownership():
@@ -213,6 +215,7 @@ def search_ownership():
 
 
 @ownership_bp.route("/api/ownership/titles")
+@require_auth(feature="ownership_search")
 @_db_retry()
 @track_feature("ownership_search", action="titles")
 def get_titles():
@@ -311,6 +314,7 @@ def get_titles():
 
 
 @ownership_bp.route("/api/ownership/suggest")
+@require_auth(feature="ownership_search")
 @_db_retry()
 def suggest_ownership():
     """Return up to N distinct company names matching a partial query — used for autocomplete."""
@@ -388,6 +392,7 @@ def _run_ownership_query(conn, sql_template: str, params: dict) -> list:
 
 
 @ownership_bp.route("/api/ownership/by-address")
+@require_auth(feature="ownership_search")
 @_db_retry()
 def ownership_by_address():
     """Find companies owning a title at the given postcode (for the map-click ownership lookup).
@@ -518,6 +523,7 @@ def _ch_resolve_name(name: str, creds: str) -> str | None:
 
 
 @ownership_bp.route("/api/ownership/companies-house/<company_number>")
+@require_auth(feature="ownership_search")
 def companies_house_lookup(company_number: str):
     """Proxy to Companies House free API — requires COMPANIES_HOUSE_API_KEY in .env.
     Accepts optional ?name= param; used as fallback when the HMLR number returns 404
@@ -567,6 +573,7 @@ def companies_house_lookup(company_number: str):
 
 
 @ownership_bp.route("/api/ownership/companies-house/<company_number>/charges")
+@require_auth(feature="ownership_search")
 def companies_house_charges(company_number: str):
     """Proxy to Companies House charges API — requires COMPANIES_HOUSE_API_KEY in .env.
     Same name-fallback logic as companies_house_lookup.
@@ -601,6 +608,7 @@ def companies_house_charges(company_number: str):
 
 
 @ownership_bp.route("/api/ownership/ch-company-search")
+@require_auth(feature="ownership_search")
 def ch_company_search():
     """Search Companies House company registry by name — used as a fallback when HMLR has 0 results."""
     api_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "").strip()
@@ -640,6 +648,7 @@ def ch_company_search():
 
 
 @ownership_bp.route("/api/ownership/stats")
+@require_auth(feature="ownership_search")
 @_db_retry()
 def get_stats():
     _ensure_table()

@@ -13,6 +13,7 @@ from flask import Blueprint, jsonify, request
 from database import SessionLocal
 from models.property_listing import ScraperRun
 from scrapers.registry import SCRAPER_REGISTRY
+from middleware.auth import require_auth
 
 scraper_bp = Blueprint("scraper", __name__, url_prefix="/scraper")
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ def _background_run(source: str, cities: list) -> None:
 
 
 @scraper_bp.route("/run", methods=["POST"])
+@require_auth(feature="scraper_view")
 def trigger_scrape():
     body = request.get_json(silent=True) or {}
     source = body.get("website", "zoopla")
@@ -50,6 +52,7 @@ def trigger_scrape():
 
 
 @scraper_bp.route("/status", methods=["GET"])
+@require_auth(feature="scraper_view")
 def scraper_status():
     session = SessionLocal()
     try:
